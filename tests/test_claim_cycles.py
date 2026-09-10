@@ -91,6 +91,23 @@ class ClaimCycleTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(count, 1)
 
+    def test_mark_cycle_complete_falls_back_when_retry_data_is_empty(self):
+        cycle_id, runs = self._activate_and_schedule()
+        run_id = runs[1][0]
+        # Simulate legacy task where retry_data was '{}'
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("UPDATE task_runs SET retry_data='{}' WHERE run_id=?", (run_id,))
+        record_game_result(self.db_path, run_id, "Game A", "claimed")
+        record_game_result(self.db_path, run_id, "Game B", "owned")
+        self.assertTrue(mark_cycle_complete_if_ready(self.db_path, run_id))
+
+        with sqlite3.connect(self.db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM claim_cycle_completions WHERE cycle_id=? AND run_id=?",
+                (cycle_id, run_id),
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
     def test_any_non_success_result_blocks_completion(self):
         _cycle_id, runs = self._activate_and_schedule()
         for run_id, status in zip(

@@ -759,9 +759,24 @@ def mark_cycle_complete_if_ready(db_path: str, run_id: str) -> bool:
             raise KeyError("Task does not exist")
         retry_data = json.loads(task["retry_data"] or "{}")
         cycle_id = str(retry_data.get("cycle_id", "")).strip()
+        expected_raw = retry_data.get("expected_games", [])
+        if not cycle_id:
+            assignment = conn.execute(
+                "SELECT cycle_id FROM claim_cycle_assignments WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if assignment:
+                cycle_id = str(assignment["cycle_id"]).strip()
         if not cycle_id:
             return True
-        expected = canonicalize_promotion_games(retry_data.get("expected_games", []))
+        if not expected_raw:
+            state_row = conn.execute(
+                "SELECT games_json FROM promotion_state WHERE singleton_id=1 AND cycle_id=?",
+                (cycle_id,),
+            ).fetchone()
+            if state_row and state_row["games_json"]:
+                with suppress(Exception):
+                    expected_raw = json.loads(state_row["games_json"])
+        expected = canonicalize_promotion_games(expected_raw)
         if promotion_cycle_id(expected) != cycle_id:
             return False
         active = conn.execute(
