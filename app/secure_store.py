@@ -602,6 +602,82 @@ def create_cycle_assignments(
     return created
 
 
+def retry_uncompleted_cycle_assignments(
+    db_path: str,
+    cycle_id: str,
+    target_games: list[dict[str, Any]],
+    start_at: int,
+    batch_size: int = 5,
+    batch_interval_seconds: int = 600,
+    min_cooldown_seconds: int = 14400,
+) -> list[tuple[str, int]]:
+    """在周期未变化的前提下，为失败且已超过冷却期的账号重新排期补跑。"""
+    created: list[tuple[str, int]] = []
+    now = utc_now()
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    retry_data = json.dumps(
+        {
+            "cycle_id": cycle_id,
+            "target_games": [game["title"] for game in target_games if game.get("title")],
+            "expected_games": target_games,
+        },
+        ensure_ascii=True,
+    )
+    with connect(db_path) as conn:
+        active = conn.execute(
+            "SELECT cycle_id FROM promotion_state WHERE singleton_id=1"
+        ).fetchone()
+        if not active or active["cycle_id"] != cycle_id:
+            return []
+
+        rows = conn.execute(
+            """
+            SELECT a.email, s.run_id, tr.updated_at
+            FROM accounts a
+            JOIN claim_cycle_assignments s ON s.email=a.email AND s.cycle_id=?
+            LEFT JOIN claim_cycle_completions c ON c.email=a.email AND c.cycle_id=?
+            JOIN task_runs tr ON tr.run_id=s.run_id
+            WHERE a.credential_ciphertext IS NOT NULL
+              AND c.email IS NULL
+              AND tr.state IN ('failed', 'manual_required')
+            ORDER BY tr.updated_at ASC, a.email ASC
+            """,
+            (cycle_id, cycle_id),
+        ).fetchall()
+
+        eligible_rows = []
+        for row in rows:
+            try:
+                dt = datetime.fromisoformat(row["updated_at"].replace("Z", "+00:00"))
+                if now_ts - int(dt.timestamp()) >= min_cooldown_seconds:
+                    eligible_rows.append(row)
+            except Exception:
+                eligible_rows.append(row)
+
+        for index, row in enumerate(eligible_rows):
+            new_run_id = str(uuid.uuid4())
+            scheduled_for = int(start_at + (index // batch_size) * batch_interval_seconds)
+            conn.execute(
+                """
+                INSERT INTO task_runs(
+                    run_id, email, mode, state, access_token_hash, retry_data,
+                    created_at, updated_at
+                ) VALUES (?, ?, 'claim', 'scheduled', ?, ?, ?, ?)
+                """,
+                (new_run_id, row["email"], hash_token(secrets.token_urlsafe(32)), retry_data, now, now),
+            )
+            conn.execute(
+                """
+                UPDATE claim_cycle_assignments
+                SET run_id=?, scheduled_for=?
+                WHERE email=? AND cycle_id=?
+                """,
+                (new_run_id, scheduled_for, row["email"], cycle_id),
+            )
+            created.append((new_run_id, scheduled_for))
+    return created
+
+
 def scheduled_cycle_runs(db_path: str, cycle_id: str) -> list[tuple[str, int]]:
     with connect(db_path) as conn:
         rows = conn.execute(

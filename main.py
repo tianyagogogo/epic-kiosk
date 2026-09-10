@@ -40,6 +40,7 @@ from app.secure_store import (
     normalize_email,
     read_secret,
     record_game_result,
+    retry_uncompleted_cycle_assignments,
     safe_profile_path,
     scheduled_cycle_runs,
     set_active_promotion_cycle,
@@ -757,6 +758,15 @@ async def refresh_promotion_cycle() -> None:
             batch_size=CLAIM_BATCH_SIZE,
             batch_interval_seconds=CLAIM_BATCH_INTERVAL_SECONDS,
         )
+        retried = retry_uncompleted_cycle_assignments(
+            DB_PATH,
+            cycle_id,
+            candidate,
+            start_at=int(datetime.now(timezone.utc).timestamp() + 60),
+            batch_size=CLAIM_BATCH_SIZE,
+            batch_interval_seconds=CLAIM_BATCH_INTERVAL_SECONDS,
+            min_cooldown_seconds=14400,
+        )
         if changed:
             print(
                 f"Promotion cycle changed: cycle={cycle_id[:12]} "
@@ -766,6 +776,11 @@ async def refresh_promotion_cycle() -> None:
             print(
                 f"Promotion cycle assignments backfilled: cycle={cycle_id[:12]} "
                 f"scheduled={len(created)}"
+            )
+        if retried:
+            print(
+                f"Promotion cycle assignments retried: cycle={cycle_id[:12]} "
+                f"scheduled={len(retried)}"
             )
         _persist_scheduled_runs(scheduled_cycle_runs(DB_PATH, cycle_id))
     except Exception as exc:

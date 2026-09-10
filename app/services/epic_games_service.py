@@ -1156,7 +1156,7 @@ class EpicGames:
                 return False
 
         try:
-            await button.wait_for(state="visible", timeout=5000)
+            await button.wait_for(state="visible", timeout=10000)
             async with EpicGames._network_probe(page, "product_page_cta"):
                 await _await_with_cleanup(
                     button.click(timeout=10000, no_wait_after=True), timeout=11
@@ -1512,23 +1512,78 @@ class EpicGames:
 
             # 1. 尝试找到主按钮
             purchase_btn = page.locator("//button[@data-testid='purchase-cta-button']").first
+            cta_candidate_selectors = [
+                "//button[@data-testid='purchase-cta-button']",
+                "button[data-testid='purchase-cta-button']",
+                "//aside//button[not(@disabled)]",
+                "//button[contains(@class, 'purchase') and not(@disabled)]",
+            ]
 
-            # 2. 检查按钮可见性
+            # 2. 检查按钮可见性与状态（渐进式轮询最多 15 秒）
+            active_btn = None
+            is_owned = False
+            start_wait = time.time()
+            max_wait_seconds = 15.0
+
             try:
-                if not await purchase_btn.is_visible(timeout=5000):
-                    all_text = await _await_with_cleanup(
-                        page.locator("body").text_content(timeout=5000),
-                        timeout=6,
-                    )
-                    if "In Library" in all_text or "Owned" in all_text:
-                        logger.success("✅ 游戏已在库中")
-                        outcomes[promotion.title] = "owned"
-                        self._emit_game_result(promotion.title, "owned")
-                        continue
-                    logger.warning(f"⚠️ 找不到购买按钮")
+                while time.time() - start_wait < max_wait_seconds:
+                    if await purchase_btn.is_visible(timeout=500):
+                        active_btn = purchase_btn
+                        break
+
+                    for sel in cta_candidate_selectors[1:]:
+                        try:
+                            cand = page.locator(sel).first
+                            if await cand.is_visible(timeout=300):
+                                active_btn = cand
+                                break
+                        except Exception:
+                            continue
+                    if active_btn is not None:
+                        break
+
+                    try:
+                        all_text = await _await_with_cleanup(
+                            page.locator("body").text_content(timeout=1000),
+                            timeout=2,
+                        )
+                        if any(w in (all_text or "") for w in ["In Library", "Owned"]):
+                            is_owned = True
+                            break
+                    except Exception:
+                        pass
+
+                    try:
+                        continue_btn = page.locator("//button//span[text()='Continue' or text()='View Product']").first
+                        if await continue_btn.is_visible(timeout=300):
+                            await continue_btn.click()
+                    except Exception:
+                        pass
+
+                    try:
+                        await page.evaluate("window.scrollBy(0, 200)")
+                    except Exception:
+                        pass
+
+                    await asyncio.sleep(0.8)
+
+                if is_owned:
+                    logger.success("✅ 游戏已在库中")
+                    outcomes[promotion.title] = "owned"
+                    self._emit_game_result(promotion.title, "owned")
+                    continue
+
+                if active_btn is None:
+                    with suppress(Exception):
+                        await page.screenshot(path="/app/app/volumes/runtime/not_found_btn.png")
+                        dump_html = await page.content()
+                        Path("/app/app/volumes/runtime/not_found_btn.html").write_text(dump_html, encoding="utf-8")
+                    logger.warning(f"⚠️ 找不到购买按钮 (已等待 {int(time.time() - start_wait)}s)")
                     outcomes[promotion.title] = "failed"
                     self._emit_game_result(promotion.title, "failed")
                     continue
+
+                purchase_btn = active_btn
             except Exception as err:
                 logger.warning(f"⚠️ 检查购买按钮失败: {err}")
                 outcomes[promotion.title] = "failed"

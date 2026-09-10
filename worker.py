@@ -637,10 +637,11 @@ def schedule_failure_retry(task_data: dict, error_type: str, warp_index: int | N
         "driver_crash": (2, (600, 1800), "浏览器驱动断连"),
         "page_timeout": (1, PAGE_TIMEOUT_RETRY_DELAY_SECONDS, "页面导航超时"),
         "task_deadline": (1, 900, "任务软期限已到"),
-        # 结账确认失败（Mechanism C）：非确定性的「点击 CTA → Epic 偶发不创建
-        # 结账 iframe」。与账号/网络无关，同一账号同游戏时好时坏，值得低频补跑一次。
-        # 仅 1 次，避免无限重试放大 WARP 出口负载。
-        "checkout_failed": (1, 1800, "结账确认失败"),
+        # 结账确认失败（Mechanism C）：
+        # 优化为 2 次退避重试：第 1 次 1800s（30分钟），第 2 次 3600s（1小时），
+        # 每次重试均自动轮换 WARP 代理出口（next_retry_warp_index），
+        # 大幅提高最终捡漏与入库成功率，同时避免短期密集并发冲击出口。
+        "checkout_failed": (2, (1800, 3600), "结账确认失败"),
     }
     if error_type not in policies:
         return False
