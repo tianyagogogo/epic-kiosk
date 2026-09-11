@@ -293,6 +293,23 @@ class CheckoutResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state, "purchase_frame")
         self.assertGreaterEqual(page.visible_checks, 3)
 
+    async def test_wait_for_checkout_surface_handles_device_not_supported_modal(self):
+        page = _CheckoutSurfacePage(visible_after=2)
+        handled = False
+
+        async def fake_handler(_page):
+            nonlocal handled
+            if not handled:
+                handled = True
+                return True
+            return False
+
+        with patch.object(EpicGames, "_handle_device_not_supported_modal", side_effect=fake_handler):
+            state = await EpicGames._wait_for_checkout_surface(page, timeout_ms=2000)
+
+        self.assertEqual(state, "purchase_frame")
+        self.assertTrue(handled)
+
     async def test_active_purchase_container_prefers_purchase_iframe(self):
         button = _FakeButton("Place Order")
         purchase_frame = _FakeContainer([button], url="https://store.epicgames.com/purchase?offers=1")
@@ -433,6 +450,56 @@ class CheckoutResultTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(button.evaluate.await_count, 1)
         self.assertEqual(button.click.await_count, 1)
 
+    async def test_confirm_checkout_success_respects_allow_page_reload(self):
+        page = SimpleNamespace(url="https://store.epicgames.com/en-US/p/example")
+        games = EpicGames(page)
+
+        with (
+            patch.object(games, "_order_history_contains", AsyncMock(return_value=False)),
+            patch.object(EpicGames, "_product_is_owned", AsyncMock(return_value=True)) as mock_owned,
+        ):
+            # When allow_page_reload is False, _product_is_owned should NOT be called
+            result = await games._confirm_checkout_success(
+                page, page.url, "ns", check_order_history=True, allow_page_reload=False
+            )
+            self.assertFalse(result)
+            mock_owned.assert_not_called()
+
+            # When allow_page_reload is True, _product_is_owned should be called
+            result = await games._confirm_checkout_success(
+                page, page.url, "ns", check_order_history=True, allow_page_reload=True
+            )
+            self.assertTrue(result)
+            mock_owned.assert_called_once()
+
+    async def test_product_is_owned_polls_until_hydrated(self):
+        call_count = 0
+
+        async def fake_text_content(timeout=1000):
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 3:
+                return "IN LIBRARY"
+            return "GET"
+
+        button = SimpleNamespace(
+            is_visible=AsyncMock(return_value=True),
+            text_content=AsyncMock(side_effect=fake_text_content),
+            is_disabled=AsyncMock(return_value=True),
+        )
+        page = SimpleNamespace(
+            locator=lambda selector: SimpleNamespace(first=button),
+        )
+
+        with (
+            patch("services.epic_games_service._goto_or_raise", AsyncMock()),
+            patch("services.epic_games_service.asyncio.sleep", AsyncMock()),
+        ):
+            is_owned = await EpicGames._product_is_owned(page, "https://example.com/p/test", timeout_seconds=5.0)
+
+        self.assertTrue(is_owned)
+        self.assertGreaterEqual(call_count, 3)
+
 
 class _CheckoutSurfacePage:
     def __init__(self, visible_after):
@@ -478,6 +545,11 @@ class _StaticVisibleLocator:
 
     async def is_visible(self, timeout=0):
         return self.visible
+
+    async def wait_for(self, state="visible", timeout=0):
+        if not self.visible:
+            raise RuntimeError("not visible")
+        return None
 
 
 class _FakeContainer:

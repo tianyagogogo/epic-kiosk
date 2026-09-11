@@ -723,8 +723,11 @@ class EpicGames:
         containers: list[tuple[str, Any]] = []
         web_purchase_iframe = page.locator("#webPurchaseContainer iframe").first
         with suppress(Exception):
-            if await web_purchase_iframe.is_visible(timeout=1000):
-                containers.append(("frameLocator[#webPurchaseContainer iframe]", page.frame_locator("#webPurchaseContainer iframe")))
+            if hasattr(web_purchase_iframe, "wait_for"):
+                await web_purchase_iframe.wait_for(state="visible", timeout=6000)
+            elif await web_purchase_iframe.is_visible(timeout=6000):
+                pass
+            containers.append(("frameLocator[#webPurchaseContainer iframe]", page.frame_locator("#webPurchaseContainer iframe")))
 
         purchase_frames = [
             frame
@@ -773,6 +776,8 @@ class EpicGames:
 
         async def _find_by_actual_button_text(label: str, container: Any):
             try:
+                with suppress(Exception):
+                    await container.locator("button").first.wait_for(state="visible", timeout=6000)
                 buttons = await container.locator("button").all()
             except Exception as e:
                 logger.debug(f"Button enumeration failed in {label}: {e}")
@@ -942,6 +947,10 @@ class EpicGames:
             if any("/purchase" in frame.url.lower() for frame in page.frames):
                 return "purchase_frame"
 
+            if await EpicGames._handle_device_not_supported_modal(page):
+                logger.info("✅ 已自动跳过设备不支持弹窗，继续等待结账页面")
+                continue
+
             # Do not issue DOM commands while Epic is creating the purchase
             # frame; Camoufox can leave those protocol calls pending forever.
             await asyncio.sleep(0.5)
@@ -1006,18 +1015,25 @@ class EpicGames:
                 logger.warning(f"🧾 已保存结账截图: {screenshot_path}")
 
     @staticmethod
-    async def _handle_device_not_supported_modal(page: Page) -> bool:
+    async def _handle_device_not_supported_modal(page: Any) -> bool:
         """Continue past Epic's intermediate unsupported-device modal."""
-        dialog = page.locator("[role='dialog']").filter(has_text=re.compile("Device not supported", re.I)).first
+        if not hasattr(page, "locator"):
+            return False
 
+        dialog = None
         try:
-            await dialog.wait_for(state="visible", timeout=3000)
+            candidate = page.locator("[role='dialog']").filter(has_text=re.compile("Device not supported", re.I)).first
+            if await candidate.is_visible(timeout=300):
+                dialog = candidate
+            else:
+                candidate = page.locator("text=/Device not supported/i").first
+                if await candidate.is_visible(timeout=200):
+                    dialog = candidate
         except Exception:
-            dialog = page.locator("text=/Device not supported/i").first
-            try:
-                await dialog.wait_for(state="visible", timeout=1000)
-            except Exception:
-                return False
+            return False
+
+        if dialog is None:
+            return False
 
         body_text = ""
         with suppress(Exception):
@@ -1052,7 +1068,7 @@ class EpicGames:
             )
             if not clicked:
                 await EpicGames._click_product_cta(continue_btn)
-            await page.wait_for_timeout(3000)
+            await page.wait_for_timeout(2000)
             return True
         except Exception as err:
             logger.warning(f"⚠️ 处理 Epic 设备不支持弹窗失败: {err}")
@@ -1084,27 +1100,34 @@ class EpicGames:
         logger.info(f"GAME_RESULT:{payload}")
 
     @staticmethod
-    async def _product_is_owned(page: Page, product_url: str) -> bool:
+    async def _product_is_owned(page: Page, product_url: str, timeout_seconds: float = 15.0) -> bool:
         """Verify ownership on the product page after checkout closes."""
         try:
             await _goto_or_raise(page, product_url, timeout=30000)
-            await asyncio.sleep(2)
             purchase_btn = page.locator("//button[@data-testid='purchase-cta-button']").first
-            if await purchase_btn.is_visible(timeout=3000):
-                text = (await purchase_btn.text_content(timeout=1000) or "").strip().upper()
-                disabled = await purchase_btn.is_disabled(timeout=1000)
-                owned_by_text = text in {"IN LIBRARY", "OWNED"}
-                # 只认显式的已拥有文本。原先是 `disabled or owned_by_text`，会把任何
-                # 禁用按钮判为已拥有 —— 2026-08-27 观测抓到两例：按钮读
-                # 'REQUIRES BASE GAME'（未拥有、缺本体）却因 disabled=True 被记成
-                # claimed，report_success 随即把"已领取"写进 logs 表，用户被告知
-                # 拿到了没拿到的游戏。8 个样本中仅文本判定全部正确，无一例外。
-                # 08-07 之前的原始实现 _current_product_is_owned 正是只按文本判定。
-                # 仍记录 disabled，便于观察 hydration 竞态等情况。
-                logger.info(
-                    f"归属检查: text='{text}' disabled={disabled} 判定={owned_by_text}"
-                )
-                return owned_by_text
+            deadline = time.monotonic() + timeout_seconds
+            last_text = ""
+            last_disabled = False
+            while time.monotonic() < deadline:
+                try:
+                    if await purchase_btn.is_visible(timeout=1000):
+                        text = (await purchase_btn.text_content(timeout=1000) or "").strip().upper()
+                        disabled = await purchase_btn.is_disabled(timeout=1000)
+                        last_text = text
+                        last_disabled = disabled
+                        if text in {"IN LIBRARY", "OWNED"}:
+                            logger.info(
+                                f"归属检查: text='{text}' disabled={disabled} 判定=True"
+                            )
+                            return True
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+
+            logger.info(
+                f"归属检查: text='{last_text}' disabled={last_disabled} 判定=False"
+            )
+            return False
         except PageNavigationTimeout:
             raise
         except Exception as err:
@@ -1243,7 +1266,6 @@ class EpicGames:
                         const init = {
                             bubbles: true,
                             cancelable: true,
-                            view: window,
                             clientX: rect.left + rect.width / 2,
                             clientY: rect.top + rect.height / 2,
                         };
@@ -1290,6 +1312,7 @@ class EpicGames:
         product_url: str,
         namespace: str | None = None,
         check_order_history: bool = True,
+        allow_page_reload: bool = False,
     ) -> bool:
         if page.url.startswith(URL_CART_SUCCESS):
             logger.success("🎉 领取成功：已进入结账成功页面")
@@ -1299,7 +1322,7 @@ class EpicGames:
             logger.success("🎉 领取成功：订单历史已确认入库")
             return True
 
-        if check_order_history and self._product_ownership_checks < 2:
+        if check_order_history and allow_page_reload and self._product_ownership_checks < 2:
             self._product_ownership_checks += 1
             if await self._product_is_owned(page, product_url):
                 logger.success("🎉 领取成功：商品页已确认入库")
@@ -1314,6 +1337,7 @@ class EpicGames:
         namespace: str | None = None,
         timeout_ms: int = 75000,
         interval_ms: int = 5000,
+        allow_page_reload: bool = False,
     ) -> bool:
         """Poll Epic's durable state after checkout/captcha UI becomes unreliable."""
         deadline = time.monotonic() + timeout_ms / 1000
@@ -1325,6 +1349,7 @@ class EpicGames:
                 product_url,
                 namespace,
                 check_order_history=False,
+                allow_page_reload=False,
             ):
                 return True
             remaining = max(0, int(deadline - time.monotonic()))
@@ -1336,6 +1361,7 @@ class EpicGames:
             product_url,
             namespace,
             check_order_history=True,
+            allow_page_reload=allow_page_reload,
         )
 
     async def _handle_instant_checkout(
@@ -1391,6 +1417,7 @@ class EpicGames:
                 namespace,
                 timeout_ms=15000,
                 interval_ms=3000,
+                allow_page_reload=False,
             ):
                 return True
 
@@ -1412,11 +1439,15 @@ class EpicGames:
 
             try:
                 if not await payment_btn.is_visible():
-                    if await self._confirm_checkout_success(page, product_url, namespace):
+                    if await self._confirm_checkout_success(
+                        page, product_url, namespace, allow_page_reload=False
+                    ):
                         return True
                     logger.warning("⚠️ 支付按钮已消失，但入库状态未确认")
             except Exception:
-                if await self._confirm_checkout_success(page, product_url, namespace):
+                if await self._confirm_checkout_success(
+                    page, product_url, namespace, allow_page_reload=False
+                ):
                     return True
                 logger.warning("⚠️ 结账 iframe 已关闭，但入库状态未确认")
 
@@ -1426,6 +1457,7 @@ class EpicGames:
                     product_url,
                     namespace,
                     timeout_ms=25000,
+                    allow_page_reload=True,
                 ):
                     return True
                 logger.error(f"❌ 即时结账无法确认，验证码异常: {challenge_error}")
@@ -1442,6 +1474,7 @@ class EpicGames:
                 namespace,
                 timeout_ms=30000,
                 interval_ms=3000,
+                allow_page_reload=True,
             ):
                 return True
 
@@ -1470,6 +1503,7 @@ class EpicGames:
         outcomes: dict[str, str] = {}
 
         for promotion in promotions:
+            self._product_ownership_checks = 0
             soft_deadline = float(os.getenv("TASK_SOFT_DEADLINE_EPOCH", "0") or 0)
             minimum_budget = float(os.getenv("TASK_MIN_GAME_BUDGET_SECONDS", "180"))
             if soft_deadline and soft_deadline - time.time() < minimum_budget:
@@ -1649,7 +1683,11 @@ class EpicGames:
                 # 点击，也不会触发新的 WARP/账号切换。
                 try:
                     if await self._confirm_checkout_success(
-                        page, url, promotion.namespace, check_order_history=True
+                        page,
+                        url,
+                        promotion.namespace,
+                        check_order_history=True,
+                        allow_page_reload=True,
                     ):
                         outcomes[promotion.title] = "claimed"
                         self._emit_game_result(promotion.title, "claimed")
