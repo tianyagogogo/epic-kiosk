@@ -67,6 +67,15 @@ class FakeRedis:
     def ttl(self, key):
         return -1
 
+    def lrange(self, key, start, stop):
+        items = [v for k, v in self.queue if k == key]
+        if stop == -1:
+            return items[start:]
+        return items[start : stop + 1]
+
+    def ltrim(self, key, start, stop):
+        return True
+
     def ping(self):
         return True
 
@@ -371,6 +380,36 @@ class SecurityQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(security_root.status_code, 200)
         self.assertEqual(security_well_known.status_code, 200)
         self.assertIn("github.com/10000ge10000/epic-kiosk", security_root.text)
+
+    def test_active_task_logs_endpoint(self):
+        from fastapi.testclient import TestClient
+
+        client = TestClient(self.main.app)
+
+        # 1. Standby state (no active task)
+        res = client.get("/api/active_task/logs")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertFalse(data["active"])
+        self.assertIn("待机", data["msg"])
+
+        # 2. Active task running
+        self.fake_redis.values["active_task:info"] = json.dumps({
+            "run_id": "test-run-123",
+            "account_ref": "abc12",
+            "started_at": int(time.time()),
+            "mode": "claim",
+        })
+        self.fake_redis.queue.append(("active_task:logs", "[acct-abc12] 🚀 任务启动"))
+        self.fake_redis.queue.append(("active_task:logs", "[acct-abc12] 🎁 发现: Test Game"))
+
+        res = client.get("/api/active_task/logs")
+        self.assertEqual(res.status_code, 200)
+        data = res.json()
+        self.assertTrue(data["active"])
+        self.assertEqual(data["task"]["account_ref"], "abc12")
+        self.assertEqual(len(data["logs"]), 2)
+        self.assertIn("Test Game", data["logs"][1])
 
     def test_noisy_css_url_path_returns_no_content(self):
         from fastapi.testclient import TestClient

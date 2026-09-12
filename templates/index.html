@@ -248,6 +248,70 @@
         let accountAccessToken = '';
         let lastModalFocus = null;
         let activeModal = null;
+        let lobbyTimer = null; let lobbyBusy = false; let logUserCleared = false;
+        let currentTabName = 'deposit'; let lastRenderedLogCount = 0;
+
+        function renderTerminal(text) {
+            const el = document.getElementById('status-log');
+            if (!el) return;
+            const container = el.parentElement;
+            const wasNearBottom = container ? (container.scrollHeight - container.scrollTop - container.clientHeight < 60) : true;
+            el.textContent = text;
+            if (container && wasNearBottom) {
+                container.scrollTop = container.scrollHeight;
+            }
+        }
+        async function fetchLobbyLogs() {
+            if (activeTask || lobbyBusy) return;
+            if (currentTabName !== 'deposit' || document.hidden) return;
+            lobbyBusy = true;
+            try {
+                const res = await axios.get('/api/active_task/logs');
+                const data = res.data;
+                if (activeTask) return;
+                const logs = Array.isArray(data.logs) ? data.logs : [];
+                if (data.active && data.task) {
+                    const modeText = data.task.mode === 'verify' ? '账号验证' : '周免领取';
+                    document.getElementById('task-panel-title').textContent = '当前任务（后台运行中）';
+                    document.getElementById('task-summary-text').textContent = `后台任务运行中 [acct-${data.task.account_ref}] · 模式: ${modeText}`;
+                    updateTaskSteps(logs.length ? logs[logs.length - 1] : '运行中', 'running');
+                    if (!logUserCleared || logs.length !== lastRenderedLogCount) {
+                        logUserCleared = false;
+                        lastRenderedLogCount = logs.length;
+                        renderTerminal(logs.length ? logs.join('\n') : '> 任务初始化中...');
+                    }
+                    scheduleLobbyPoll(2000);
+                } else {
+                    document.getElementById('task-panel-title').textContent = '当前任务';
+                    if (data.last_task) {
+                        const finishedTime = data.last_task.finished_at ? new Date(data.last_task.finished_at * 1000).toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '';
+                        const duration = data.last_task.duration_seconds ? ` · 耗时 ${data.last_task.duration_seconds}s` : '';
+                        document.getElementById('task-summary-text').textContent = `系统待机中 · 最近任务 [acct-${data.last_task.account_ref}] 于 ${finishedTime} 完成${duration}`;
+                    } else {
+                        document.getElementById('task-summary-text').textContent = '系统待机中。所有周免任务均已完成，等待下一次周期调度。';
+                    }
+                    updateTaskSteps('', '');
+                    if (!logUserCleared) {
+                        let content = '';
+                        if (logs.length) {
+                            content = logs.join('\n') + '\n\n' + '> [系统待机] 等待下一次周期调度任务...';
+                        } else {
+                            content = '> 系统待机中。所有周免任务均已完成，等待下一次周期调度。\n> 准备就绪。';
+                        }
+                        renderTerminal(content);
+                    }
+                    scheduleLobbyPoll(5000);
+                }
+            } catch (err) {
+                scheduleLobbyPoll(6000);
+            } finally {
+                lobbyBusy = false;
+            }
+        }
+        function scheduleLobbyPoll(delay) {
+            if (lobbyTimer) clearTimeout(lobbyTimer);
+            lobbyTimer = setTimeout(fetchLobbyLogs, delay);
+        }
         const START_BUTTON_HTML = '<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.9" d="M8 5v14l11-7z"></path></svg><span>启动引擎</span>';
         const ERROR_CONFIGS = {
             eula_failed: { title:'需要您帮忙操作一下', desc:'这个账号需要先同意 Epic 的服务协议，系统自动处理失败了。', steps:true, icon:'info', tone:'warning' },
@@ -275,6 +339,12 @@
 
         document.addEventListener('DOMContentLoaded', () => {
             loadRememberedEmail(); fetchSystemStats(); window.setInterval(fetchSystemStats, 30000);
+            fetchLobbyLogs();
+            document.addEventListener('visibilitychange', () => {
+                if (!document.hidden && currentTabName === 'deposit' && !activeTask) {
+                    scheduleLobbyPoll(200);
+                }
+            });
             document.getElementById('success-modal').addEventListener('click', event => { if (event.target.id === 'success-modal') closeModal(); });
             document.addEventListener('keydown', handleGlobalKeydown);
             document.querySelector('.nav-tabs').addEventListener('keydown', event => {
@@ -292,7 +362,7 @@
         function escapeHtml(value) { return String(value ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;'); }
         function safeHttpUrl(value, fallback = '') { try { const url = new URL(String(value), window.location.origin); return ['http:','https:'].includes(url.protocol) ? url.href : fallback; } catch { return fallback; } }
         function loadRememberedEmail() { const email = localStorage.getItem('remembered_email'); if (email && localStorage.getItem('remember_email_checked') === 'true') { document.getElementById('d_email').value=email; document.getElementById('q_email').value=email; document.getElementById('remember_email').checked=true; } }
-        function saveRememberedEmail(email) { const remember = document.getElementById('remember_email').checked; if (remember && email) { localStorage.setItem('remembered_email', email); localStorage.setItem('remember_email_checked','true'); } else if (!remember) { localStorage.removeItem('remembered_email'); localStorage.setItem('remember_email_checked','false'); } }
+        saveRememberedEmail = function(email) { const remember = document.getElementById('remember_email').checked; if (remember && email) { localStorage.setItem('remembered_email', email); localStorage.setItem('remember_email_checked','true'); } else if (!remember) { localStorage.removeItem('remembered_email'); localStorage.setItem('remember_email_checked','false'); } };
         function setServiceState(state, label) { const el = document.getElementById('service-status'); if (!el) return; el.className = `header-utility service-state ${state === 'unavailable' ? 'is-unavailable' : state === 'checking' ? 'is-checking' : ''}`; el.lastElementChild.textContent=label; }
         async function fetchSystemStats() { try { const res = await axios.get('/api/system_stats'); const data=res.data; document.getElementById('stat-accounts').textContent=`${data.verified_accounts || 0}/${data.total_accounts || 0}`; document.getElementById('stat-today').textContent=data.today_claims ?? 0; document.getElementById('stat-total').textContent=data.total_claims ?? 0; // processing_count 已经是 task_runs 里 queued+running+deferred 的完整在途集合，
             // 再加 redis 队列长度会把同一个排队任务算两遍。
@@ -305,7 +375,7 @@
             else if (oldest && oldest > 900) setServiceState('checking',`队列积压 ${Math.round(oldest/60)} 分钟`);
             else setServiceState('online','服务状态正常');
             } catch (error) { console.error('Failed to fetch stats:', error); setServiceState('unavailable','服务状态暂不可用'); } }
-        function switchTab(tab) { ['deposit','query','free-games'].forEach(name => { const active=name===tab; const view=document.getElementById(`view-${name}`); const button=document.getElementById(`tab-${name}`); view.classList.toggle('hidden',!active); button.className=`tab-btn ${active ? 'tab-btn-active' : 'tab-btn-inactive'}`; button.setAttribute('aria-selected',String(active)); button.tabIndex=active?0:-1; }); document.getElementById('stats-section').classList.toggle('hidden',tab !== 'deposit'); if (tab === 'free-games') fetchFreeGames(); }
+        function switchTab(tab) { currentTabName = tab; ['deposit','query','free-games'].forEach(name => { const active=name===tab; const view=document.getElementById(`view-${name}`); const button=document.getElementById(`tab-${name}`); view.classList.toggle('hidden',!active); button.className=`tab-btn ${active ? 'tab-btn-active' : 'tab-btn-inactive'}`; button.setAttribute('aria-selected',String(active)); button.tabIndex=active?0:-1; }); document.getElementById('stats-section').classList.toggle('hidden',tab !== 'deposit'); if (tab === 'deposit' && !activeTask) scheduleLobbyPoll(100); if (tab === 'free-games') fetchFreeGames(); }
         function formatPromotionEnd(value) { if (!value) return '促销时间以 Epic 商店为准'; const date=new Date(value); return Number.isNaN(date.getTime()) ? '促销时间以 Epic 商店为准' : `截至 ${date.toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'})}`; }
         function fallbackCover() { return '<div class="cover-fallback" aria-hidden="true"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6" d="M8 12h.01M16 12h.01M7 18h10a4 4 0 0 0 4-4v-2a4 4 0 0 0-4-4h-1l-1-2H9L8 8H7a4 4 0 0 0-4 4v2a4 4 0 0 0 4 4Z"></path><path d="M8 12h3m-1.5-1.5v3"></path></svg></div>'; }
         async function fetchFreeGames() { const skeleton=document.getElementById('free-games-skeleton'); const grid=document.getElementById('free-games-grid'); const empty=document.getElementById('free-games-empty'); skeleton.classList.remove('hidden'); grid.classList.add('hidden'); empty.classList.add('hidden'); try { const res=await axios.get('/api/free_games'); const games=Array.isArray(res.data.data) ? res.data.data : []; skeleton.classList.add('hidden'); if (!games.length || (games.length===1 && !games[0].slug)) { empty.classList.remove('hidden'); return; } grid.innerHTML=games.map(game => { const url=safeHttpUrl(game.url,'https://store.epicgames.com/zh-CN/free-games'); const image=safeHttpUrl(game.image); const title=escapeHtml(game.title || '未知游戏'); return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" class="free-game-card" aria-label="前往 Epic 商店查看 ${title}"><div class="free-cover">${image ? `<img src="${escapeHtml(image)}" alt="${title}" loading="lazy" onerror="this.replaceWith(document.createRange().createContextualFragment(fallbackCover()))">` : fallbackCover()}</div><div class="game-info"><span class="free-badge">本周免费</span><h3 class="game-name">${title}</h3><p class="free-description">${escapeHtml(game.description || 'Epic Games Store 限时促销')}</p><span class="game-meta"><span class="state-dot" aria-hidden="true"></span>${escapeHtml(formatPromotionEnd(game.promotion_end))}</span></div></a>`; }).join(''); grid.classList.remove('hidden'); } catch (error) { skeleton.classList.add('hidden'); empty.classList.remove('hidden'); showToast('获取免费游戏失败','error'); } }
@@ -313,7 +383,7 @@
         function togglePwd(id, button) { const input=document.getElementById(id); const reveal=input.type==='password'; input.type=reveal?'text':'password'; button.title=reveal?'隐藏密码':'显示密码'; button.setAttribute('aria-label',button.title); }
         function updateTaskSteps(message, result='') { const text=String(message || '').toLowerCase(); let current=1; if (/(验证|登录|验证码|captcha|browser)/.test(text)) current=2; if (/(领取|保存|入库|claim|succeed)/.test(text)) current=3; document.querySelectorAll('.task-step').forEach(step => { const index=Number(step.dataset.step); step.classList.toggle('is-active',index===current && !['failed','manual_required'].includes(result)); step.classList.toggle('is-complete',index<current || (result==='succeeded' && index<=current)); }); }
         function setDepositBusy(busy) { const form=document.getElementById('deposit-form'); const button=document.getElementById('btn-deposit'); form.classList.toggle('is-busy',busy); form.querySelectorAll('input,button').forEach(el => { el.disabled=busy; }); button.setAttribute('aria-busy',String(busy)); button.innerHTML=busy ? '<span class="loader-mark" style="width:16px;height:16px;border-width:2px"></span><span>正在启动…</span>' : START_BUTTON_HTML; }
-        async function startVerify() { const email=document.getElementById('d_email').value; const password=document.getElementById('d_password').value; if (!email || !password) { showToast('请输入邮箱和密码','warning'); return; } saveRememberedEmail(email); setDepositBusy(true); document.getElementById('task-summary-text').textContent='正在提交账号并准备浏览器环境。'; document.getElementById('status-log').textContent='> 正在提交账号并准备浏览器环境。'; updateTaskSteps('提交账号'); try { const res=await axios.post('/api/deposit',{email,password}); if (res.data.status !== 'queued') { showToast(res.data.msg,res.data.status==='busy'?'warning':'error'); document.getElementById('status-log').textContent=`> ${res.data.msg}`; resetUI(); return; } activeTask={id:res.data.task_id,token:res.data.access_token}; document.getElementById('d_password').value=''; showToast(res.data.msg,'success'); document.getElementById('status-log').textContent=`> ${res.data.msg}`; pollStartedAt=Date.now(); pollFailures=0; pollBusy=false; pollTimer=window.setInterval(checkStatus,1500); checkStatus(); } catch (error) { showToast(error.response?.data?.msg || '任务提交失败','error'); resetUI(); } }
+        async function startVerify() { const email=document.getElementById('d_email').value; const password=document.getElementById('d_password').value; if (!email || !password) { showToast('请输入邮箱和密码','warning'); return; } saveRememberedEmail(email); setDepositBusy(true); logUserCleared=false; if (lobbyTimer) clearTimeout(lobbyTimer); document.getElementById('task-panel-title').textContent='当前任务'; document.getElementById('task-summary-text').textContent='正在提交账号并准备浏览器环境。'; renderTerminal('> 正在提交账号并准备浏览器环境。'); updateTaskSteps('提交账号'); try { const res=await axios.post('/api/deposit',{email,password}); if (res.data.status !== 'queued') { showToast(res.data.msg,res.data.status==='busy'?'warning':'error'); renderTerminal(`> ${res.data.msg}`); resetUI(); return; } activeTask={id:res.data.task_id,token:res.data.access_token}; document.getElementById('d_password').value=''; showToast(res.data.msg,'success'); renderTerminal(`> ${res.data.msg}`); pollStartedAt=Date.now(); pollFailures=0; pollBusy=false; pollTimer=window.setInterval(checkStatus,1500); checkStatus(); } catch (error) { showToast(error.response?.data?.msg || '任务提交失败','error'); resetUI(); } }
         async function deleteAccount() { const email=document.getElementById('d_email').value; const password=document.getElementById('d_password').value; if (!email || !password) { showToast('请输入账号密码确认身份','warning'); return; } if (!window.confirm('确定停止托管并删除该账号的本地登录信息吗？此操作不会删除 Epic 账号，但需要重新提交密码才能再次托管。')) return; try { const session=await axios.post('/api/session',{email,password}); const res=await axios.post('/api/delete_account',{}, {headers:{Authorization:`Bearer ${session.data.access_token}`}}); showToast(res.data.msg,res.data.status==='success'?'success':'error'); if (res.data.status==='success') { document.getElementById('d_email').value=''; document.getElementById('d_password').value=''; localStorage.removeItem('remembered_email'); document.getElementById('remember_email').checked=false; fetchSystemStats(); } } catch { showToast('删除失败','error'); } }
         async function checkStatus() { if (!activeTask) return;
             // setInterval 不等上一次 await 返回，请求慢于 1.5 秒时会不断堆叠。
@@ -324,7 +394,7 @@
                 clearInterval(pollTimer); showToast('任务状态查询超时，请刷新页面确认结果','warning',6000); resetUI(); return;
             }
             pollBusy=true;
-            try { const res=await axios.get(`/api/tasks/${encodeURIComponent(activeTask.id)}`,{headers:{Authorization:`Bearer ${activeTask.token}`}}); const log=document.getElementById('status-log'); if (!log.textContent.includes(res.data.msg)) log.textContent=`> ${res.data.msg}\n${log.textContent}`; document.getElementById('task-summary-text').textContent=res.data.msg; updateTaskSteps(res.data.msg,res.data.status); if (res.data.status==='succeeded') { clearInterval(pollTimer); try { const confirmed=await axios.post('/api/confirm_success',{task_id:activeTask.id},{headers:{Authorization:`Bearer ${activeTask.token}`}}); accountAccessToken=confirmed.data.access_token; showModal(res.data.game_title || 'Epic Free Game'); showToast('任务完成！','success'); } catch { showToast('领取成功，但账号保存失败，请重新提交一次','warning',6000); } resetUI(); fetchSystemStats(); } else if (res.data.status==='manual_required' || res.data.status==='failed') { clearInterval(pollTimer); showErrorModal(res.data.error_type || (res.data.status==='failed'?'unknown':'captcha_manual_required'),res.data.hint); resetUI(); }
+            try { const res=await axios.get(`/api/tasks/${encodeURIComponent(activeTask.id)}`,{headers:{Authorization:`Bearer ${activeTask.token}`}}); const logs=Array.isArray(res.data.logs)?res.data.logs:[]; if (logs.length) { renderTerminal(logs.join('\n')); } else if (res.data.msg) { renderTerminal(`> ${res.data.msg}`); } document.getElementById('task-summary-text').textContent=res.data.msg; updateTaskSteps(res.data.msg,res.data.status); if (res.data.status==='succeeded') { clearInterval(pollTimer); try { const confirmed=await axios.post('/api/confirm_success',{task_id:activeTask.id},{headers:{Authorization:`Bearer ${activeTask.token}`}}); accountAccessToken=confirmed.data.access_token; showModal(res.data.game_title || 'Epic Free Game'); showToast('任务完成！','success'); } catch { showToast('领取成功，但账号保存失败，请重新提交一次','warning',6000); } resetUI(); fetchSystemStats(); } else if (res.data.status==='manual_required' || res.data.status==='failed') { clearInterval(pollTimer); showErrorModal(res.data.error_type || (res.data.status==='failed'?'unknown':'captcha_manual_required'),res.data.hint); resetUI(); }
             // deferred = worker 已把任务放进延迟重试队列。此前没有这个分支，
             // 状态既不是 succeeded 也不是 failed，定时器永不清除、页面无限轮询。
             else if (res.data.status==='deferred') { clearInterval(pollTimer); showToast(res.data.msg || '已安排稍后自动重试，可以关闭页面','info',8000); resetUI(); }
@@ -333,8 +403,8 @@
               if ([401,404,410].includes(error.response?.status)) { clearInterval(pollTimer); showToast('任务会话已失效，请刷新后重试','error'); resetUI(); }
               else if (++pollFailures >= 20) { clearInterval(pollTimer); showToast('无法获取任务状态，请刷新页面确认结果','error',6000); resetUI(); }
             } finally { pollBusy=false; } }
-        function clearTaskLog() { document.getElementById('status-log').textContent='准备就绪。'; }
-        function resetUI() { if (pollTimer) { clearInterval(pollTimer); pollTimer=null; } activeTask=null; setDepositBusy(false); document.getElementById('task-summary-text').textContent='暂无运行中的任务。启动后会在这里显示关键进度。'; updateTaskSteps('',''); }
+        function clearTaskLog() { logUserCleared=true; renderTerminal('准备就绪。'); }
+        function resetUI() { if (pollTimer) { clearInterval(pollTimer); pollTimer=null; } activeTask=null; setDepositBusy(false); scheduleLobbyPoll(1000); }
         function openModal(id) { const modal=document.getElementById(id); lastModalFocus=document.activeElement; activeModal=modal; modal.classList.remove('hidden'); window.setTimeout(() => modal.querySelector('.modal-card')?.focus(),0); }
         function closeActiveModal(id) { const modal=document.getElementById(id); modal.classList.add('hidden'); if (activeModal===modal) activeModal=null; lastModalFocus?.focus?.(); }
         function showModal(gameName) { document.getElementById('modal-game-name').textContent=gameName; document.getElementById('modal-game-link').href=`https://store.epicgames.com/zh-CN/browse?q=${encodeURIComponent(gameName)}&sortBy=relevancy`; openModal('success-modal'); }

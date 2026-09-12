@@ -135,6 +135,8 @@ def set_task_feedback(
     run_id = task_data["run_id"]
     if status is not None:
         r.set(task_redis_key(run_id, "status"), status, ex=TASK_LOCK_SECONDS)
+        ref = account_ref(task_data.get("email"))
+        record_task_log(run_id, f"[acct-{ref}] {status}")
     if result is not None:
         r.set(task_redis_key(run_id, "result"), result, ex=TASK_LOCK_SECONDS)
     if hint is not None:
@@ -150,17 +152,38 @@ def set_task_feedback(
     )
 
 
-def redact_log_line(line: str, email: str, password: str) -> str:
-    safe = line.replace(email, f"acct-{account_ref(email)}")
+def redact_log_line(line: str, email: str = "", password: str = "") -> str:
+    safe = line
+    if email:
+        safe = safe.replace(email, f"acct-{account_ref(email)}")
     if password:
         safe = safe.replace(password, "<redacted>")
     safe = re.sub(
-        r"(?i)(authorization|api[_-]?key|cookie|token)(\s*[:=]\s*)([^\s,;]+)",
+        r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
+        lambda m: f"acct-{account_ref(m.group(0))}",
+        safe,
+    )
+    safe = re.sub(
+        r"(?i)(authorization|api[_-]?key|cookie|token|password|secret)(\s*[:=]\s*)([^\s,;]+)",
         r"\1\2<redacted>",
         safe,
     )
     safe = re.sub(r"\b[A-Za-z0-9_-]{80,}\b", "<token>", safe)
+    safe = re.sub(r"http://(?:warp|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}):\d+", "http://<proxy>", safe)
     return safe
+
+
+def record_task_log(run_id: str, line: str) -> None:
+    safe = redact_log_line(line)
+    try:
+        r.rpush(f"task:{run_id}:logs", safe)
+        r.rpush("active_task:logs", safe)
+        r.ltrim("active_task:logs", -100, -1)
+        r.ltrim(f"task:{run_id}:logs", -200, -1)
+        r.expire("active_task:logs", 1800)
+        r.expire(f"task:{run_id}:logs", 1800)
+    except Exception:
+        pass
 
 
 def _mark_sigchld(signum, frame):
@@ -1366,6 +1389,19 @@ def run_task(task_data):
     warp_index = get_task_warp_index(task_data)
     warp_port = get_warp_proxy_port(warp_index)
     print(f"Task started: run_id={run_id} mode={mode} account={ref} warp={warp_index}:{warp_port}")
+
+    task_info = {
+        "run_id": run_id,
+        "account_ref": ref,
+        "started_at": int(time.time()),
+        "mode": mode or "claim",
+    }
+    with suppress(Exception):
+        r.set("active_task:info", json.dumps(task_info, ensure_ascii=False), ex=TASK_LOCK_SECONDS)
+        r.delete("active_task:logs")
+        start_line = f"[acct-{ref}] 🚀 任务启动 (模式: {'账号验证' if mode == 'verify' else '周免领取'})"
+        record_task_log(run_id, start_line)
+
     set_task_feedback(task_data, status="🚀 初始化环境...", state="running")
 
     # ============================================================
@@ -1383,6 +1419,8 @@ def run_task(task_data):
             error_type="warp_unavailable",
         )
         print(f"Task failed: run_id={run_id} error=warp_unavailable")
+        with suppress(Exception):
+            r.delete("active_task:info")
         return
 
     env = os.environ.copy()
@@ -1440,8 +1478,10 @@ def run_task(task_data):
                 continue  # 完全过滤
             if translated:
                 line = translated
-
-            print(f"[acct-{ref}] {redact_log_line(line, email, password)}")
+            safe_line = redact_log_line(line, email, password)
+            log_entry = f"[acct-{ref}] {safe_line}"
+            print(log_entry)
+            record_task_log(run_id, log_entry)
 
             # ============================================================
             # 🔥 新增：解析错误类型（格式: ❌ ERROR_TYPE:xxx）
@@ -1831,6 +1871,21 @@ def run_task(task_data):
             f"page_goto_timeout_total={WORKER_METRICS['page_goto_timeout_total']} "
             f"unhandled_asyncio_future_total={WORKER_METRICS['unhandled_asyncio_future_total']}"
         )
+        with suppress(Exception):
+            r.delete("active_task:info")
+            fin_line = f"[acct-{ref}] 🏁 任务执行完成"
+            record_task_log(run_id, fin_line)
+
+            task_status = r.get(task_redis_key(run_id, "status")) or "completed"
+            last_task = {
+                "run_id": run_id,
+                "account_ref": ref,
+                "mode": mode or "claim",
+                "finished_at": int(time.time()),
+                "duration_seconds": round(duration, 1),
+                "status": task_status,
+            }
+            r.set("last_task:info", json.dumps(last_task, ensure_ascii=False), ex=86400)
 
 def main_loop():
     log_worker_boot_info()

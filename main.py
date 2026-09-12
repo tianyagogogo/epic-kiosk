@@ -1,4 +1,5 @@
 import os
+import time
 import asyncio
 import json
 import sqlite3
@@ -241,6 +242,7 @@ async def anti_abuse_middleware(request: Request, call_next):
         "/api/free_games",
         "/api/admin/metrics",
         "/api/admin/unban",
+        "/api/active_task/logs",
     }:
         return JSONResponse(
             status_code=503,
@@ -250,7 +252,18 @@ async def anti_abuse_middleware(request: Request, call_next):
     # 未鉴权的读接口也要有节流。/api/system_stats 会跑 5 条 SQL，
     # 线上单 IP 已经打进去 7554 次，而此前限流只覆盖下面两个写入口。
     # 读接口用宽松得多的配额，只挡住明显的滥用。
-    if path.startswith("/api/") and request.url.path not in {"/api/deposit", "/api/session"}:
+    # 高频轻量 Redis 读接口（活跃大厅日志）不计入重型 SQL 接口配额，使用独立防护。
+    if request.url.path == "/api/active_task/logs":
+        log_key = f"rate_log_read:{request.client.host}"
+        log_count = r.incr(log_key)
+        if log_count == 1:
+            r.expire(log_key, 60)
+        if log_count > 120:
+            return JSONResponse(
+                status_code=429,
+                content={"status": "rate_limited", "msg": "⏳ 请求过于频繁，请稍后重试"},
+            )
+    elif path.startswith("/api/") and request.url.path not in {"/api/deposit", "/api/session"}:
         read_key = f"rate_read:{request.client.host}"
         read_count = r.incr(read_key)
         if read_count == 1:
@@ -603,6 +616,47 @@ async def get_status(email: str):
     raise HTTPException(status_code=410, detail="Use /api/tasks/{task_id}")
 
 
+@app.get("/api/active_task/logs")
+def get_active_task_logs():
+    raw_info = r.get("active_task:info")
+    raw_last = r.get("last_task:info")
+
+    active_info = None
+    if raw_info:
+        try:
+            active_info = json.loads(raw_info if isinstance(raw_info, str) else raw_info.decode("utf-8"))
+            if time.time() - active_info.get("started_at", 0) > TASK_LOCK_SECONDS:
+                active_info = None
+        except Exception:
+            active_info = None
+
+    last_info = None
+    if raw_last:
+        try:
+            last_info = json.loads(raw_last if isinstance(raw_last, str) else raw_last.decode("utf-8"))
+        except Exception:
+            last_info = None
+
+    raw_logs = r.lrange("active_task:logs", 0, -1) or []
+    logs = [l.decode("utf-8") if isinstance(l, bytes) else l for l in raw_logs]
+
+    if active_info:
+        return {
+            "active": True,
+            "task": active_info,
+            "last_task": last_info,
+            "logs": logs,
+        }
+    return {
+        "active": False,
+        "task": None,
+        "last_task": last_info,
+        "system_status": "standby",
+        "msg": "系统待机中。所有周免任务均已完成，等待下一次周期调度。",
+        "logs": logs,
+    }
+
+
 @app.get("/api/tasks/{task_id}")
 def get_task(task_id: str, authorization: str | None = Header(default=None)):
     token = _bearer_token(authorization)
@@ -626,6 +680,8 @@ def get_task(task_id: str, authorization: str | None = Header(default=None)):
                 (task_id,),
             )
         ]
+    raw_logs = r.lrange(f"task:{task_id}:logs", 0, -1) or []
+    logs = [l.decode("utf-8") if isinstance(l, bytes) else l for l in raw_logs]
     return {
         "status": row["state"],
         "msg": row["status_message"] or "Waiting...",
@@ -636,6 +692,7 @@ def get_task(task_id: str, authorization: str | None = Header(default=None)):
         "started_at": row["started_at"],
         "finished_at": row["finished_at"],
         "games": games,
+        "logs": logs,
     }
 
 @app.post("/api/confirm_success")
