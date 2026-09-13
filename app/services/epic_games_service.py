@@ -276,6 +276,8 @@ def _is_driver_disconnect_error(err: Exception | str) -> bool:
             "connection closed while reading from the driver",
             "browsercontext.close: connection closed",
             "cannot read properties of undefined",
+            "target page, context or browser has been closed",
+            "targetclosederror",
             "playwright/driver",
             "node.js v",
         )

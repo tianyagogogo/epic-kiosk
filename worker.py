@@ -1600,7 +1600,12 @@ def run_task(task_data):
                 set_task_feedback(task_data, status="⚠️ 操作超时，重试中...")
                 has_critical_error = True
 
-            if "Connection closed while reading from the driver" in line or "playwright/driver" in line:
+            if (
+                "Connection closed while reading from the driver" in line
+                or "playwright/driver" in line
+                or "target page, context or browser has been closed" in line.lower()
+                or "targetclosederror" in line.lower()
+            ):
                 final_error_type = "driver_crash"
                 set_task_feedback(task_data, status="⚠️ 浏览器驱动断连，准备延迟重试")
 

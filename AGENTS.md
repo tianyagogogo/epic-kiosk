@@ -79,3 +79,28 @@ docker compose up -d web worker
 - `OPERATIONS.md` 属于私有运维说明，不应进入 Git 跟踪文件；如需保留，只能放在仓库外的私有目录。
 - 面向 GitHub 的文档只写通用部署、通用配置和脱敏示例；生产实例专属信息必须放在本机私有知识库或仓库外私有目录。
 - 提交前必须检查 `git status --short` 和 `git diff --cached --name-only`，确认没有私有运维文档、运行数据、截图或密钥被暂存。
+
+
+## 工具使用与防错规范
+
+- **grep_search 工具入参规范**：
+  - 合法入参仅限：`Query`、`SearchPath`、`MatchPerLine`、`CaseInsensitive`、`Includes`、`IsRegex`。
+  - **严禁传入 `LineNumber` 参数**：`LineNumber` 是搜索结果的**返回输出字段**，不是输入参数。获取匹配行及行号时，**只需传入 `"MatchPerLine": true`**。切勿将 `LineNumber` 作为入参传入，否则会触发严格 Schema 拦截。
+
+## 容器化浏览器资源与进程治理
+
+- **cgroup pids_limit 线程预算准则**：
+  - Linux cgroup 的 `pids_limit`（`pids.current` / `pids.max`）统计的是所有轻量级线程（LWP）。
+  - Camoufox/Firefox 现代化多进程（Main, Forkserver, Tab, Socket, RDD, Utility, Node.js, Xvfb）启动时单个实例峰值达 180~220 个线程。
+  - `docker-compose.yml` 中的 `worker.pids_limit` **不得低于 500**（建议设定为 800 以上），防止加载多 Frame 或 hCaptcha 验证码时触发 `EAGAIN` 导致浏览器意外崩溃。
+- **跨 UID 孤儿进程防死锁**：
+  - Worker 以普通用户 `app (UID 1002)` 运行，无法清理 `root` 用户调试残留的进程。
+  - 容器调试命令必须显式使用与容器一致的用户：`docker exec -u 1002:1002 epic-worker ...`。
+
+## 自动化异常分级与自愈重试
+
+- **严禁把底层驱动断连归类为未知错误**：
+  - `TargetClosedError`、`PageClosedError` 或 `"target page, context or browser has been closed"` 属于底层驱动瞬态崩溃，必须归类为 `driver_crash`，自动触发 2 阶退避重试与 WARP 代理 IP 轮换自愈，严禁降级为终态 `unknown`。
+- **批量补跑状态重置**：
+  - 触发多游戏周免批量补漏脚本时，必须重置 `retry_data` 中的 `target_games` 局部约束（置为空 `{}`），以便 Worker 基于订单历史自动补齐所有缺失游戏。
+
