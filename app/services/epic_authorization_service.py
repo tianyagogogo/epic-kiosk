@@ -535,7 +535,7 @@ class EpicAuthorization:
 
         try:
             point_url = "https://www.epicgames.com/account/personal?lang=en-US&productName=egs&sessionInvalidated=true"
-            await self.page.goto(point_url, wait_until="domcontentloaded")
+            await self.page.goto(point_url, wait_until="domcontentloaded", timeout=45000)
             if await self._confirm_login_state_from_page("explicit login navigation"):
                 return (True, ErrorType.SUCCESS)
 
@@ -792,9 +792,9 @@ class EpicAuthorization:
             # 此前它们全部落进 unknown，而 unknown 不在任何重试策略里 ——
             # 一类本可自愈的失败反而成了唯一不重试、且提示为"未知错误"的类型。
             message = str(err)
-            if "Timeout 30000ms exceeded" in message and any(
-                op in message
-                for op in ("Page.click", "Locator.click", "Locator.clear", "Locator.type", "Locator.fill")
+            if "Timeout" in message and (
+                any(op in message for op in ("Page.click", "Locator.click", "Locator.clear", "Locator.type", "Locator.fill", "Page.goto"))
+                or "exceeded" in message.lower()
             ):
                 await self._save_login_debug("login_page_interaction_timeout")
                 return (False, ErrorType.LOGIN_PAGE_TIMEOUT)

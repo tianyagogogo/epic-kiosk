@@ -428,6 +428,15 @@ def is_exit_ip_blocked(ip: str) -> bool:
         return False
 
 
+def clear_blocked_exit_ips() -> None:
+    """清理 Redis 中的出口 IP 风控黑名单。"""
+    if not r:
+        return
+    with suppress(Exception):
+        r.delete("kiosk:blocked_exit_ips")
+        print("🧹 已重置出口 IP 风控黑名单")
+
+
 def mark_exit_ip_blocked(ip: str, ttl_seconds: int = 1800) -> None:
     if not ip or not r:
         return
@@ -469,15 +478,21 @@ def ensure_warp_ready(preferred_index: int = 0) -> ProxyReadinessResult:
     print(f"🔍 Checking proxy: {WARP_PROXY_HOST}:{actual_port} [index={actual_index}]")
 
     # 2. 验证真实出口并自动避让受风控 IP
-    for attempt in range(1, 4):
+    max_attempts = min(6, WARP_PROXY_COUNT)
+    for attempt in range(1, max_attempts + 1):
         success, info = check_warp_proxy(actual_index)
         if success:
             exit_ip = info
-            if is_exit_ip_blocked(exit_ip) and attempt < 3 and WARP_PROXY_COUNT > 1:
-                print(f"⚠️ 出口 IP {exit_ip} 处于 Epic 风控拦截名单，快速顺延探测下一个端口...")
-                actual_index = (actual_index + 1) % WARP_PROXY_COUNT
-                actual_port = get_warp_proxy_port(actual_index)
-                continue
+            if is_exit_ip_blocked(exit_ip):
+                if attempt < max_attempts and WARP_PROXY_COUNT > 1:
+                    print(f"⚠️ 出口 IP {exit_ip} 处于 Epic 风控拦截名单，快速顺延探测下一个端口... [{attempt}/{max_attempts}]")
+                    actual_index = (actual_index + 1) % WARP_PROXY_COUNT
+                    actual_port = get_warp_proxy_port(actual_index)
+                    continue
+                else:
+                    # 所有轮换均落入黑名单，说明发生全池误杀，自愈重置
+                    print(f"⚠️ 代理池出口均处于风控名单中，触发自愈清空拦截黑名单，放行出口: {exit_ip}")
+                    clear_blocked_exit_ips()
 
             print(f"✅ Proxy ready - exit IP: {exit_ip}")
             with suppress(Exception):
@@ -488,8 +503,8 @@ def ensure_warp_ready(preferred_index: int = 0) -> ProxyReadinessResult:
                 )
             return ProxyReadinessResult(True, actual_index)
 
-        print(f"⚠️ Proxy check failed [{attempt}/3]: {info}")
-        if attempt < 3 and WARP_PROXY_COUNT > 1:
+        print(f"⚠️ Proxy check failed [{attempt}/{max_attempts}]: {info}")
+        if attempt < max_attempts and WARP_PROXY_COUNT > 1:
             actual_index = (actual_index + 1) % WARP_PROXY_COUNT
             actual_port = get_warp_proxy_port(actual_index)
             print(f"⚡ 尝试切换到下一个备选端口: {actual_port} [index={actual_index}]")
@@ -1633,6 +1648,7 @@ def run_task(task_data):
         # schedule_failure_retry 对 checkout_failed 的策略是 (1, 1800)，最多一次，
         # 不会无限重试放大 WARP 负载。
         if not successful_games and failed_games and not is_fatal_failure:
+            block_current_exit_ip(warp_index)
             retry_task = dict(task_data)
             retry_task["retry_data"] = dict(task_data.get("retry_data", {}))
             retry_task["retry_data"]["target_games"] = failed_games

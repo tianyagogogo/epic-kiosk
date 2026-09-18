@@ -1449,6 +1449,36 @@ class EpicGames:
             pass
         return False
 
+    @staticmethod
+    async def _is_checkout_loading(page: Page, container: Any = None) -> bool:
+        """检查结账界面是否正处于 Loading / Spinner 订单处理状态。"""
+        selectors = [
+            "div.css-kp23du",
+            "svg[aria-label='loading']",
+            "svg[role='progressbar']",
+            ".eds_300_1esthdc1",
+            ".eds_300_1rzlrua0",
+        ]
+        for sel in selectors:
+            try:
+                if container and hasattr(container, "locator"):
+                    if await container.locator(sel).first.is_visible(timeout=150):
+                        return True
+            except Exception:
+                pass
+            try:
+                if await page.locator(sel).first.is_visible(timeout=150):
+                    return True
+            except Exception:
+                pass
+            for fr in page.frames:
+                try:
+                    if fr != page.main_frame and await fr.locator(sel).first.is_visible(timeout=100):
+                        return True
+                except Exception:
+                    pass
+        return False
+
     async def _confirm_checkout_success(
         self,
         page: Page,
@@ -1482,9 +1512,10 @@ class EpicGames:
         page: Page,
         product_url: str,
         namespace: str | None = None,
-        timeout_ms: int = 75000,
-        interval_ms: int = 5000,
+        timeout_ms: int = 40000,
+        interval_ms: int = 3000,
         allow_page_reload: bool = False,
+        container: Any = None,
     ) -> bool:
         """Poll Epic's durable state after checkout/captcha UI becomes unreliable."""
         deadline = time.monotonic() + timeout_ms / 1000
@@ -1495,16 +1526,21 @@ class EpicGames:
                 logger.warning("⚠️ 检测到结账被 Cloudflare / Talon 安全风控拦截，立即中断并触发节点轮换")
                 raise CloudflareBlockedException("Checkout blocked by Epic security challenge (Talon / Cloudflare)")
 
+            # 每隔 2 次复核允许查一次订单历史，加速确认
+            allow_order_history = (attempt % 2 == 0)
             if await self._confirm_checkout_success(
                 page,
                 product_url,
                 namespace,
-                check_order_history=False,
+                check_order_history=allow_order_history,
                 allow_page_reload=False,
             ):
                 return True
+
+            is_loading = await self._is_checkout_loading(page, container)
             remaining = max(0, int(deadline - time.monotonic()))
-            logger.info(f"🔁 等待入库确认: 第 {attempt} 次复核，剩余约 {remaining}s")
+            load_tag = " [⏳ 处理中 Spinner 激活]" if is_loading else ""
+            logger.info(f"🔁 等待入库确认: 第 {attempt} 次复核，剩余约 {remaining}s{load_tag}")
             await asyncio.sleep(interval_ms / 1000)
 
         if await self._is_cloudflare_challenge(page):
@@ -1617,9 +1653,10 @@ class EpicGames:
                 page,
                 product_url,
                 namespace,
-                timeout_ms=15000,
+                timeout_ms=40000,
                 interval_ms=3000,
                 allow_page_reload=False,
+                container=wpc,
             ):
                 return True
 
@@ -1660,6 +1697,7 @@ class EpicGames:
                     namespace,
                     timeout_ms=25000,
                     allow_page_reload=True,
+                    container=wpc,
                 ):
                     return True
                 logger.error(f"❌ 即时结账无法确认，验证码异常: {challenge_error}")
@@ -1668,9 +1706,22 @@ class EpicGames:
             if challenge_error is None:
                 if await self._is_cloudflare_challenge(page):
                     raise CloudflareBlockedException("Checkout blocked by Epic security challenge (Talon / Cloudflare)")
+
+                # 仅在未处于 Loading 且按钮未被 disable 时才尝试补点
+                is_loading = await self._is_checkout_loading(page, wpc)
+                btn_disabled = True
                 with suppress(Exception):
                     await self._click_checkout_cta(wpc, payment_btn)
                     await asyncio.sleep(2)
+                    btn_disabled = await payment_btn.is_disabled()
+
+                if is_loading or btn_disabled:
+                    logger.info("⏳ 结账界面仍在 Loading 处理或按钮已禁用，跳过重复点击，继续等待入库...")
+                else:
+                    with suppress(Exception):
+                        logger.info("⚡ 补试点击结账 CTA...")
+                        await self._click_checkout_cta(wpc, payment_btn)
+                        await asyncio.sleep(2)
 
             if await self._wait_for_checkout_confirmation(
                 page,
@@ -1679,6 +1730,7 @@ class EpicGames:
                 timeout_ms=30000,
                 interval_ms=3000,
                 allow_page_reload=True,
+                container=wpc,
             ):
                 return True
 
