@@ -50,6 +50,7 @@ ehthumbs.db
 logs/
 
 # 测试和覆盖率
+tests/
 .coverage
 htmlcov/
 .pytest_cache/

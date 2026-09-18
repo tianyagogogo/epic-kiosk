@@ -53,6 +53,9 @@ services:
       context: .
     image: epic-kiosk-web:local
     container_name: epic-web
+    networks:
+      - default
+      - zen-proxy
     ports:
       - "127.0.0.1:18000:8000"
     volumes:
@@ -68,6 +71,12 @@ services:
       - CLAIM_BATCH_SIZE=${CLAIM_BATCH_SIZE:-5}
       - CLAIM_BATCH_INTERVAL_SECONDS=${CLAIM_BATCH_INTERVAL_SECONDS:-600}
       - PROMOTION_REFRESH_INTERVAL_SECONDS=${PROMOTION_REFRESH_INTERVAL_SECONDS:-3600}
+      # 机场代理配置（连接 zen-airport-proxy 容器的 27 个 Slot 端口）
+      - WARP_PROXY_HOST=zen-airport-proxy
+      - WARP_PROXY_START_PORT=19025
+      - WARP_PROXY_COUNT=27
+      - WARP_EXPECT_WARP=false
+      - WARP_CONTROL_URL_TEMPLATE=
       # 可选历史数据偏移量，默认不补偿。
       - CLAIM_HISTORY_OFFSET=${CLAIM_HISTORY_OFFSET:-0}
       - ACCOUNT_VERIFIED_OFFSET=${ACCOUNT_VERIFIED_OFFSET:-0}
@@ -92,36 +101,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # ============================================================
-  # WARP 代理：单容器多出口（10 个独立 WARP 实例）
-  # 端口: epic-warp:19000-19009
-  # 控制接口: http://epic-warp:18080/restart/{idx}
-  # ============================================================
-  warp:
-    image: zen-warp-multi:local
-    container_name: epic-warp
-    restart: always
-    init: true
-    privileged: true
-    environment:
-      - WARP_INSTANCE_COUNT=10
-      - WARP_START_PORT=19000
-      - WARP_CONTROL_PORT=18080
-    volumes:
-      - ./data/warp:/warp-data
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 8m
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-    mem_limit: 5g
-
 
   # ============================================================
   # Worker: 后台任务执行器（浏览器自动化）
@@ -135,6 +114,9 @@ services:
     image: epic-kiosk-worker:local
     container_name: epic-worker
     user: "1002:1002"
+    networks:
+      - default
+      - zen-proxy
     init: true
     cpus: "2.00"
     pids_limit: 800
@@ -171,14 +153,15 @@ services:
       - HCAPTCHA_FRAME_TIMEOUT=20
       - HCAPTCHA_SOLVE_MAX_ATTEMPTS=2
       - HCAPTCHA_LOG_DIR=/app/data/logs/hcaptcha
-      # WARP HTTP 代理（容器内部网络）
-      - HTTP_PROXY=http://epic-warp:19000
-      - HTTPS_PROXY=http://epic-warp:19000
-      # WARP 代理配置（用于检测、选择端口和重启单个出口）
-      - WARP_PROXY_HOST=epic-warp
-      - WARP_PROXY_START_PORT=19000
-      - WARP_PROXY_COUNT=10
-      - WARP_CONTROL_URL_TEMPLATE=http://epic-warp:18080/restart/{idx}
+      # 机场代理（连接 zen-airport-proxy 容器）
+      - HTTP_PROXY=http://zen-airport-proxy:19025
+      - HTTPS_PROXY=http://zen-airport-proxy:19025
+      # 代理池配置（27 个 Mixed 端口，多国轮换）
+      - WARP_PROXY_HOST=zen-airport-proxy
+      - WARP_PROXY_START_PORT=19025
+      - WARP_PROXY_COUNT=27
+      - WARP_EXPECT_WARP=false
+      - WARP_CONTROL_URL_TEMPLATE=
       # 内部服务不走代理（修复入库 API 失败问题）
       - NO_PROXY=web,epic-web,redis,epic-redis,localhost,127.0.0.1
       # ============================================================
@@ -208,19 +191,10 @@ services:
       - PRIMARY_MODEL_FALLBACK=deepseek-ai/DeepSeek-V4-Pro
       # 验证码失败后的自动恢复策略
       - COOKIE_INVALID_MAX_RETRIES=${COOKIE_INVALID_MAX_RETRIES:-1}
-      - WARP_RESTART_COOLDOWN_SECONDS=300
-      - WARP_CONTROL_RESTART_RETRIES=${WARP_CONTROL_RESTART_RETRIES:-3}
-      - WARP_CONTROL_RESTART_BACKOFF_SECONDS=${WARP_CONTROL_RESTART_BACKOFF_SECONDS:-5}
-      - WARP_CONTAINER_FALLBACK_RESTARTS=0
       - TASK_SPACING_SECONDS=10
-      # 让浏览器指纹按 WARP 出口 IP 对齐时区/语言/经纬度。改的是指纹，
-      # 而账号用的是带既有登录态的持久化 profile，建议在一轮周免跑完
-      # 确认基线之后再置为 1；出问题改回 0 重启即可，无需重建镜像。
       - EPIC_ENABLE_GEOIP=${EPIC_ENABLE_GEOIP:-0}
     depends_on:
       redis:
-        condition: service_healthy
-      warp:
         condition: service_healthy
     restart: always
     secrets:
@@ -272,3 +246,8 @@ secrets:
     file: ${CAPTCHA_SILICONFLOW_API_KEY_PATH:-/dev/null}
   captcha_gemini_api_key:
     file: ${CAPTCHA_GEMINI_API_KEY_PATH:-/dev/null}
+
+networks:
+  default:
+  zen-proxy:
+    external: true

@@ -86,11 +86,11 @@ new = '''    async def get_challenge_frame_locator(self) -> Frame | None:
                 for frame in challenge_frames:
                     last_candidate = frame
                     with suppress(Exception):
-                        challenge_view = frame.locator("//div[contains(@class, 'challenge-view')]")
-                        if await challenge_view.is_visible(timeout=1000):
+                        challenge_view = frame.locator("//div[contains(@class, 'challenge-view') or contains(@class, 'interface-wrapper') or contains(@class, 'challenge-container')]")
+                        if await challenge_view.first.is_visible(timeout=1000):
                             return frame
                     with suppress(Exception):
-                        if await frame.locator("//div[contains(@class, 'challenge-view')]").count() > 0:
+                        if await frame.locator("//div[contains(@class, 'challenge-view') or contains(@class, 'interface-wrapper') or contains(@class, 'challenge-container')]").count() > 0:
                             return frame
             except Exception as e:
                 logger.error(f"Error finding hCaptcha challenge iframes: {e}")
@@ -214,6 +214,10 @@ text = text.replace(
     "                self._solve_attempt_count = 0\n"
     "                await asyncio.wait_for(self._solve_captcha(), timeout=self.config.EXECUTION_TIMEOUT)",
 )
+text = text.replace(
+    "//div[@class='challenge-view']",
+    "(//div[contains(@class, 'challenge-view') or contains(@class, 'interface-wrapper')])[1]",
+)
 target.write_text(text)
 
 collector = Path("/usr/local/lib/python3.12/site-packages/hcaptcha_challenger/agent/collector.py")
@@ -221,6 +225,10 @@ text = collector.read_text()
 text = text.replace(
     "self._captcha_payload_queue.get(), timeout=10\n",
     "self._captcha_payload_queue.get(), timeout=float(os.getenv(\"HCAPTCHA_PAYLOAD_TIMEOUT\", \"60\"))\n",
+)
+text = text.replace(
+    "//div[@class='challenge-view']",
+    "(//div[contains(@class, 'challenge-view') or contains(@class, 'interface-wrapper')])[1]",
 )
 collector.write_text(text)
 PY

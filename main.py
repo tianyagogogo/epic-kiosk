@@ -867,6 +867,7 @@ WARP_CONTROL_URL_TEMPLATE = os.getenv(
 WARP_PROBE_INTERVAL_SECONDS = max(60, int(os.getenv("WARP_PROBE_INTERVAL_SECONDS", "600")))
 WARP_PROBE_URL = os.getenv("WARP_PROBE_URL", "https://www.cloudflare.com/cdn-cgi/trace")
 WARP_PROBE_TIMEOUT_SECONDS = float(os.getenv("WARP_PROBE_TIMEOUT_SECONDS", "15"))
+WARP_EXPECT_WARP = os.getenv("WARP_EXPECT_WARP", "true").lower() in {"1", "true", "yes"}
 # 连续失败达到该次数才重启，避免单次网络抖动触发重启
 WARP_PROBE_FAILURES_BEFORE_RESTART = max(
     1, int(os.getenv("WARP_PROBE_FAILURES_BEFORE_RESTART", "2"))
@@ -882,6 +883,7 @@ WARP_PROBE_MAX_RESTARTS_PER_ROUND = max(
 
 async def _probe_warp_egress(index: int) -> dict:
     """走指定出口请求 trace 接口，确认既连得通、又确实在 WARP 隧道内。"""
+    """走指定出口请求 trace 接口，确认既连得通、又确实在有效代理隧道内。"""
     port = WARP_PROXY_START_PORT + index
     started = datetime.now().timestamp()
     record: dict = {"index": index, "port": port, "checked_at": int(started)}
@@ -905,6 +907,15 @@ async def _probe_warp_egress(index: int) -> dict:
         if not record["ok"] and response.status_code == 200:
             # 能出网但没走隧道 —— 出口 IP 已经泄漏成宿主 IP
             record["error"] = "warp_tunnel_down"
+        if WARP_EXPECT_WARP:
+            record["ok"] = response.status_code == 200 and fields.get("warp") == "on"
+            if not record["ok"] and response.status_code == 200:
+                # 能出网但没走隧道 —— 出口 IP 已经泄漏成宿主 IP
+                record["error"] = "warp_tunnel_down"
+        else:
+            record["ok"] = response.status_code == 200 and bool(fields.get("ip"))
+            if not record["ok"] and response.status_code == 200:
+                record["error"] = "proxy_ip_missing"
     except Exception as exc:
         record["ok"] = False
         record["error"] = type(exc).__name__
@@ -913,6 +924,8 @@ async def _probe_warp_egress(index: int) -> dict:
 
 
 async def _restart_warp_egress(index: int) -> bool:
+    if not WARP_CONTROL_URL_TEMPLATE:
+        return False
     url = WARP_CONTROL_URL_TEMPLATE.format(idx=index)
     try:
         async with httpx.AsyncClient(timeout=90, trust_env=False) as client:

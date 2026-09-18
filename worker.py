@@ -314,7 +314,15 @@ def get_task_warp_index(task_data: dict) -> int:
 
 
 def next_retry_warp_index(error_type: str, current_index: int) -> int:
-    if error_type not in {"network_timeout", "driver_crash"} or WARP_PROXY_COUNT <= 1:
+    """与网络连接、页面超时、驱动断连或节点风控相关的所有错误，重试时一律自动轮换出口端口。"""
+    rotatable_errors = {
+        "network_timeout",
+        "driver_crash",
+        "page_timeout",
+        "checkout_failed",
+        "cloudflare_blocked",
+    }
+    if error_type not in rotatable_errors or WARP_PROXY_COUNT <= 1:
         return current_index
     return (current_index + 1) % WARP_PROXY_COUNT
 
@@ -363,225 +371,142 @@ def check_warp_proxy(idx: int = 0) -> tuple[bool, str]:
         return False, str(e)[:50]
 
 
-def get_warp_health_url() -> str:
-    """Return the WARP control health URL derived from the restart endpoint."""
-    if not WARP_CONTROL_URL_TEMPLATE:
-        return ""
-    if "/restart/" in WARP_CONTROL_URL_TEMPLATE:
-        return WARP_CONTROL_URL_TEMPLATE.split("/restart/", 1)[0].rstrip("/") + "/health"
-    return WARP_CONTROL_URL_TEMPLATE.rstrip("/") + "/health"
-
-
-def request_warp_control(method: str, url: str, **kwargs):
-    """Call the WARP control API without inheriting HTTP_PROXY/HTTPS_PROXY."""
-    with requests.Session() as session:
-        session.trust_env = False
-        return session.request(method, url, **kwargs)
-
-
-def _control_health_reports_ready(idx: int) -> tuple[bool, str]:
-    health_url = get_warp_health_url()
-    if not health_url:
-        return False, "control health URL is not configured"
+def quick_probe_proxy(idx: int, timeout: float = 0.5) -> bool:
+    """毫秒级快速探测代理端口 TCP 连通性（默认 500ms 超时）。"""
+    port = get_warp_proxy_port(idx)
     try:
-        resp = request_warp_control("GET", health_url, timeout=10)
-        if resp.status_code != 200:
-            return False, f"health status={resp.status_code}"
-        payload = resp.json()
-        if not payload.get("ok"):
-            return False, f"health not ok: {str(payload)[:120]}"
-        for inst in payload.get("instances", []):
-            if int(inst.get("index", -1)) == idx:
-                if inst.get("process_running") and inst.get("forwarder_running"):
-                    return True, "control health ready"
-                return False, f"instance not ready: {inst}"
-        return False, f"index {idx} not found in health payload"
-    except Exception as exc:
-        return False, f"health error={exc}"
-
-
-def wait_for_warp_recovery(idx: int, timeout_seconds: int = 60) -> bool:
-    """Poll control health and proxy connectivity without triggering another restart."""
-    deadline = time.monotonic() + max(1, timeout_seconds)
-    last_info = "not checked"
-    while True:
-        health_ok, health_info = _control_health_reports_ready(idx)
-        proxy_ok, proxy_info = check_warp_proxy(idx)
-        if proxy_ok:
-            if health_ok:
-                print(f"✅ WARP recovered: index={idx} info={proxy_info}")
-            else:
-                print(
-                    f"✅ WARP proxy reachable while control health is not ready: "
-                    f"index={idx} health={health_info} proxy={proxy_info}"
-                )
-            return True
-
-        last_info = f"{health_info}; proxy={proxy_info}"
-        if time.monotonic() >= deadline:
-            print(f"⚠️ WARP recovery wait timed out: index={idx} last={last_info}")
-            return False
-        time.sleep(min(2, max(1, int(deadline - time.monotonic()))))
-
-
-def restart_warp_instance_via_control(idx: int = 0) -> bool:
-    """Restart one WARP instance through the control API with bounded backoff."""
-    if not WARP_CONTROL_URL_TEMPLATE:
-        print("⚠️ WARP control restart URL is not configured; skip single-exit restart")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            return sock.connect_ex((WARP_PROXY_HOST, port)) == 0
+    except Exception:
         return False
 
-    url = WARP_CONTROL_URL_TEMPLATE.format(idx=idx, index=idx, port=get_warp_proxy_port(idx))
-    for attempt in range(1, WARP_CONTROL_RESTART_RETRIES + 1):
-        try:
-            resp = request_warp_control("POST", url, timeout=120)
-            if resp.status_code == 200:
-                print(
-                    f"🔄 WARP control restart accepted: index={idx} port={get_warp_proxy_port(idx)} "
-                    f"[{attempt}/{WARP_CONTROL_RESTART_RETRIES}]"
-                )
-                return wait_for_warp_recovery(
-                    idx,
-                    timeout_seconds=max(30, WARP_CONTROL_RESTART_BACKOFF_SECONDS * 3),
-                )
+
+def get_fast_healthy_proxy_index(preferred_idx: int, max_scan: int = 10) -> int:
+    """从首选端口开始快速探测，若异常则在毫秒级内自动顺延至下一个健康端口。"""
+    if WARP_PROXY_COUNT <= 1:
+        return 0
+    # 先快速探测首选端口（通常耗时 1~5ms）
+    if quick_probe_proxy(preferred_idx, timeout=0.5):
+        return preferred_idx
+
+    # 首选端口不通，立即在毫秒级内探测备用端口
+    for step in range(1, min(max_scan, WARP_PROXY_COUNT)):
+        candidate = (preferred_idx + step) % WARP_PROXY_COUNT
+        if quick_probe_proxy(candidate, timeout=0.4):
             print(
-                f"⚠️ WARP control restart failed: index={idx} status={resp.status_code} "
-                f"body={resp.text[:200]} [{attempt}/{WARP_CONTROL_RESTART_RETRIES}]"
+                f"⚡ 端口 {get_warp_proxy_port(preferred_idx)} 异常，毫秒级快速顺延至健康出口: "
+                f"{get_warp_proxy_port(candidate)} [index={candidate}]"
             )
-        except Exception as e:
-            print(
-                f"⚠️ WARP control restart error: index={idx} error={e} "
-                f"[{attempt}/{WARP_CONTROL_RESTART_RETRIES}]"
-            )
-
-        # The supervisor may still be restarting the instance after a 5xx response.
-        if wait_for_warp_recovery(idx, timeout_seconds=WARP_CONTROL_RESTART_BACKOFF_SECONDS):
-            print(f"✅ WARP recovered after control failure: index={idx}")
-            return True
-        if attempt < WARP_CONTROL_RESTART_RETRIES:
-            time.sleep(WARP_CONTROL_RESTART_BACKOFF_SECONDS * attempt)
-
-    print(f"❌ WARP single-exit recovery exhausted: index={idx}")
-    return False
+            return candidate
+    return preferred_idx
 
 
-def restart_whole_warp_container() -> bool:
-    """Restart the whole WARP container as a last-resort fallback."""
+class ProxyReadinessResult(tuple):
+    """同时兼容 tuple 解包 (is_ready, actual_index) 与条件判断 if ensure_warp_ready(...):"""
+    def __new__(cls, is_ready: bool, actual_index: int):
+        return super().__new__(cls, (bool(is_ready), int(actual_index)))
+
+    def __bool__(self) -> bool:
+        return self[0]
+
+    @property
+    def ready(self) -> bool:
+        return self[0]
+
+    @property
+    def index(self) -> int:
+        return self[1]
+
+
+def is_exit_ip_blocked(ip: str) -> bool:
+    if not ip or not r:
+        return False
     try:
-        result = subprocess.run(["docker", "restart", "epic-warp"], capture_output=True, text=True, timeout=180)
-        if result.returncode == 0:
-            print(f"🔄 WARP container fallback restart done: {result.stdout.strip()}")
-            time.sleep(15)
-            return True
-        print(f"❌ WARP container fallback restart failed: {result.stderr}")
-        return False
-    except subprocess.TimeoutExpired:
-        print("❌ WARP container fallback restart timed out")
-        return False
-    except FileNotFoundError:
-        print("⚠️ docker command is unavailable; cannot fallback restart WARP container")
-        return False
-    except Exception as e:
-        print(f"❌ WARP container fallback restart error: {e}")
+        return bool(r.sismember("kiosk:blocked_exit_ips", ip))
+    except Exception:
         return False
 
 
-def restart_warp_container(idx: int = 0) -> bool:
-    """Recover one WARP exit first; restart the whole container only as a bounded fallback."""
-    if restart_warp_instance_via_control(idx):
-        return True
-
-    if WARP_CONTAINER_FALLBACK_RESTARTS <= 0:
-        print(f"⚠️ WARP container fallback disabled: index={idx}")
-        return False
-
-    for attempt in range(1, WARP_CONTAINER_FALLBACK_RESTARTS + 1):
-        print(f"🔄 WARP container fallback restart [{attempt}/{WARP_CONTAINER_FALLBACK_RESTARTS}]")
-        if restart_whole_warp_container() and wait_for_warp_recovery(idx, timeout_seconds=90):
-            return True
-
-    print(f"❌ WARP recovery failed: index={idx}")
-    return False
+def mark_exit_ip_blocked(ip: str, ttl_seconds: int = 1800) -> None:
+    if not ip or not r:
+        return
+    try:
+        r.sadd("kiosk:blocked_exit_ips", ip)
+        r.expire("kiosk:blocked_exit_ips", ttl_seconds)
+        print(f"🛡️ 已将受风控出口 IP 加入避让黑名单 (TTL={ttl_seconds}s): {ip}")
+    except Exception:
+        pass
 
 
-def ensure_warp_ready(warp_index: int = 0) -> bool:
-    """Check WARP readiness and run at most one recovery flow per check cycle."""
+def block_current_exit_ip(warp_index: int) -> None:
+    try:
+        raw = r.get(f"metrics:warp:{warp_index}")
+        if raw:
+            data = json.loads(raw)
+            exit_ip = data.get("exit_ip")
+            if exit_ip:
+                mark_exit_ip_blocked(exit_ip)
+    except Exception:
+        pass
+
+
+def ensure_warp_ready(preferred_index: int = 0) -> ProxyReadinessResult:
+    """Check proxy readiness with sub-second failover across slots and bypass blocked exit IPs."""
     if not os.getenv("HTTP_PROXY") and not os.getenv("HTTPS_PROXY"):
-        print("ℹ️ WARP proxy is not configured; skip readiness check")
+        print("ℹ️ Proxy is not configured; skip readiness check")
         with suppress(Exception):
             r.setex(
-                f"metrics:warp:{warp_index}",
+                f"metrics:warp:{preferred_index}",
                 300,
                 json.dumps({"status": "not_configured", "updated_at": int(time.time())}),
             )
-        return True
+        return ProxyReadinessResult(True, preferred_index)
 
-    print(f"🔍 Checking WARP proxy: {WARP_PROXY_HOST}:{get_warp_proxy_port(warp_index)} [index={warp_index}]")
+    # 1. 毫秒级选择健康端口
+    actual_index = get_fast_healthy_proxy_index(preferred_index)
+    actual_port = get_warp_proxy_port(actual_index)
+    print(f"🔍 Checking proxy: {WARP_PROXY_HOST}:{actual_port} [index={actual_index}]")
 
-    recovery_attempted = False
-    for attempt in range(1, WARP_MAX_RETRIES + 1):
-        success, info = check_warp_proxy(warp_index)
-
+    # 2. 验证真实出口并自动避让受风控 IP
+    for attempt in range(1, 4):
+        success, info = check_warp_proxy(actual_index)
         if success:
-            print(f"✅ WARP ready - exit IP: {info}")
+            exit_ip = info
+            if is_exit_ip_blocked(exit_ip) and attempt < 3 and WARP_PROXY_COUNT > 1:
+                print(f"⚠️ 出口 IP {exit_ip} 处于 Epic 风控拦截名单，快速顺延探测下一个端口...")
+                actual_index = (actual_index + 1) % WARP_PROXY_COUNT
+                actual_port = get_warp_proxy_port(actual_index)
+                continue
+
+            print(f"✅ Proxy ready - exit IP: {exit_ip}")
             with suppress(Exception):
                 r.setex(
-                    f"metrics:warp:{warp_index}",
+                    f"metrics:warp:{actual_index}",
                     300,
-                    json.dumps({"status": "healthy", "updated_at": int(time.time())}),
+                    json.dumps({"status": "healthy", "exit_ip": exit_ip, "updated_at": int(time.time())}),
                 )
-            return True
+            return ProxyReadinessResult(True, actual_index)
 
-        print(f"⚠️ WARP check failed [{attempt}/{WARP_MAX_RETRIES}]: {info}")
+        print(f"⚠️ Proxy check failed [{attempt}/3]: {info}")
+        if attempt < 3 and WARP_PROXY_COUNT > 1:
+            actual_index = (actual_index + 1) % WARP_PROXY_COUNT
+            actual_port = get_warp_proxy_port(actual_index)
+            print(f"⚡ 尝试切换到下一个备选端口: {actual_port} [index={actual_index}]")
 
-        if attempt < WARP_MAX_RETRIES:
-            if not recovery_attempted:
-                print("🔄 Starting one WARP recovery flow...")
-                if restart_warp_container(warp_index):
-                    print("✅ WARP recovery flow completed; rechecking...")
-                else:
-                    print("⚠️ WARP recovery flow failed; continue health polling...")
-                recovery_attempted = True
-            else:
-                print("⏳ WARP recovery already attempted in this cycle; wait and recheck...")
-                time.sleep(WARP_CONTROL_RESTART_BACKOFF_SECONDS)
-
-    print("❌ WARP readiness check failed after bounded recovery")
+    print("❌ Proxy readiness check failed after failover")
     with suppress(Exception):
         r.setex(
-            f"metrics:warp:{warp_index}",
+            f"metrics:warp:{actual_index}",
             300,
             json.dumps({"status": "unhealthy", "updated_at": int(time.time())}),
         )
-    return False
+    return ProxyReadinessResult(False, actual_index)
 
 
 def restart_warp_for_retry(email: str, reason: str, warp_index: int = 0) -> bool:
-    """可恢复失败后按冷却时间重启 WARP，避免连续抖动代理。"""
-    ref = account_ref(email)
-    if not os.getenv("HTTP_PROXY") and not os.getenv("HTTPS_PROXY"):
-        print(f"Account {ref}: no WARP proxy; skip recovery for {reason}")
-        return False
-
-    now = time.time()
-    restart_key = f"warp:last_restart_at:{warp_index}"
-    last_restart = r.get(restart_key)
-    if last_restart:
-        try:
-            elapsed = now - float(last_restart)
-            if elapsed < WARP_RESTART_COOLDOWN_SECONDS:
-                wait_left = int(WARP_RESTART_COOLDOWN_SECONDS - elapsed)
-                print(f"Account {ref}: WARP cooldown remaining={wait_left}s")
-                return False
-        except ValueError:
-            pass
-
-    print(f"Account {ref}: restart WARP reason={reason}")
-    ok = restart_warp_container(warp_index)
-    if ok:
-        r.set(restart_key, str(time.time()), ex=max(WARP_RESTART_COOLDOWN_SECONDS * 2, 3600))
-    else:
-        print(f"Account {ref}: WARP recovery failed")
-    return ok
+    """保留兼容桩：机场代理池由 Mihomo 底座自动维护连接与容灾，无需外部重启。"""
+    return True
 
 def reset_profile_for_retry(profile_id: str, ref: str) -> int:
     """删除该账号的本地浏览器 profile，清理失效 Cookie/CSRF 状态。"""
@@ -662,9 +587,11 @@ def schedule_failure_retry(task_data: dict, error_type: str, warp_index: int | N
         "task_deadline": (1, 900, "任务软期限已到"),
         # 结账确认失败（Mechanism C）：
         # 优化为 2 次退避重试：第 1 次 1800s（30分钟），第 2 次 3600s（1小时），
-        # 每次重试均自动轮换 WARP 代理出口（next_retry_warp_index），
+        # 每次重试均自动轮换代理出口（next_retry_warp_index），
         # 大幅提高最终捡漏与入库成功率，同时避免短期密集并发冲击出口。
         "checkout_failed": (2, (1800, 3600), "结账确认失败"),
+        # Cloudflare 5秒盾拦截（节点风控）：2分钟后换新端口重试
+        "cloudflare_blocked": (2, (120, 600), "Cloudflare 5秒盾拦截"),
     }
     if error_type not in policies:
         return False
@@ -1080,6 +1007,11 @@ ERROR_TYPE_MESSAGES = {
         "hint": "本次任务已停止重复点击，系统将在稍后低频重试",
         "nuke": False,
     },
+    "cloudflare_blocked": {
+        "status": "🛡️ 节点被 Cloudflare 拦截 (5秒盾)",
+        "hint": "出口节点被 Epic/Cloudflare 临时拦截，系统已自动顺延切换至全新节点重试",
+        "nuke": False,
+    },
     # 账号开启了两步验证
     "two_factor_required": {
         "status": "❌ 该账号开启了两步验证",
@@ -1405,20 +1337,19 @@ def run_task(task_data):
     set_task_feedback(task_data, status="🚀 初始化环境...", state="running")
 
     # ============================================================
-    # 🌐 WARP 代理检测
-    # 领取前先检测 WARP 是否可以访问 Epic Games
-    # 如果不通则重启 WARP 容器换 IP，最多尝试 5 次
+    # 🌐 代理检测与毫秒级快速顺延选优
     # ============================================================
-    if not ensure_warp_ready(warp_index):
+    is_ready, warp_index = ensure_warp_ready(warp_index)
+    if not is_ready:
         set_task_feedback(
             task_data,
             status="❌ 网络代理不可用",
-            result="warp_unavailable",
-            hint="WARP 代理无法连接 Epic Games，请联系管理员",
+            result="proxy_unavailable",
+            hint="代理端口探测与故障转移均失败，请检查机场代理服务",
             state="failed",
-            error_type="warp_unavailable",
+            error_type="proxy_unavailable",
         )
-        print(f"Task failed: run_id={run_id} error=warp_unavailable")
+        print(f"Task failed: run_id={run_id} error=proxy_unavailable")
         with suppress(Exception):
             r.delete("active_task:info")
         return
@@ -1682,7 +1613,10 @@ def run_task(task_data):
             "captcha_unsolved",
             "captcha_invalid",
             "login_page_timeout",
+            "cloudflare_blocked",
         } and not is_fatal_failure:
+            if final_error_type == "cloudflare_blocked":
+                block_current_exit_ip(warp_index)
             schedule_failure_retry(task_data, final_error_type, warp_index)
             return
 

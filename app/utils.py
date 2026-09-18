@@ -116,9 +116,16 @@ CONSOLE_KEYWORDS = [
     "发现:",
     "GAME_RESULT:",
     # 错误
+    # 错误与安全拦截
     "错误",
     "失败",
     "警告",
+    "One more step",
+    "风控",
+    "hCaptcha",
+    "等待入库确认",
+    "归属检查",
+    "快速顺延",
     # 网络探针（Mechanism C 观测）：让点击 CTA 前后的 Epic 请求/响应
     # 透传到控制台（docker logs），便于肉眼复盘黑盒。
     "网络探针",

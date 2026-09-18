@@ -12,6 +12,7 @@ import time
 from contextlib import asynccontextmanager, suppress
 from enum import Enum
 from json import JSONDecodeError
+from pathlib import Path
 from typing import Any, List
 
 import httpx
@@ -76,6 +77,14 @@ class GameCollectResult(Enum):
 
     # 失败：页面导航超时，避免在同一任务内立即重复打开浏览器
     PAGE_TIMEOUT = "page_timeout"
+
+    # 失败：节点出口遭 Cloudflare 拦截 (5秒盾 / Turnstile)，需立即切换出口重试
+    CLOUDFLARE_BLOCKED = "cloudflare_blocked"
+
+
+class CloudflareBlockedException(RuntimeError):
+    """当前节点出口 IP 被 Cloudflare 拦截 (5秒盾 / Turnstile)。"""
+    pass
 
 
 class PageNavigationTimeout(RuntimeError):
@@ -651,6 +660,8 @@ class EpicAgent:
             except Exception as e:
                 logger.exception(e)
                 error_message = str(e).lower()
+                if isinstance(e, CloudflareBlockedException) or "cloudflare" in error_message:
+                    return GameCollectResult.CLOUDFLARE_BLOCKED
                 if isinstance(e, PageNavigationTimeout):
                     return GameCollectResult.PAGE_TIMEOUT
                 if _is_driver_disconnect_error(e):
@@ -906,7 +917,7 @@ class EpicGames:
         def _on_request(req):
             try:
                 u = req.url or ""
-                if "epicgames.com" in u or "egs" in u or "purchase" in u or "cart" in u:
+                if any(k in u for k in ["epicgames.com", "egs", "purchase", "cart", "hcaptcha", "graphql", "order", "talon"]):
                     seen[f"REQ {req.method} {_norm(u)}"] = seen.get(f"REQ {req.method} {_norm(u)}", 0) + 1
             except Exception:
                 pass
@@ -914,7 +925,7 @@ class EpicGames:
         def _on_response(resp):
             try:
                 u = resp.url or ""
-                if "epicgames.com" in u or "egs" in u or "purchase" in u or "cart" in u:
+                if any(k in u for k in ["epicgames.com", "egs", "purchase", "cart", "hcaptcha", "graphql", "order", "talon"]):
                     key = f"RES {resp.status} {_norm(u)}"
                     seen[key] = seen.get(key, 0) + 1
             except Exception:
@@ -951,6 +962,10 @@ class EpicGames:
 
             if await EpicGames._handle_device_not_supported_modal(page):
                 logger.info("✅ 已自动跳过设备不支持弹窗，继续等待结账页面")
+                continue
+
+            if await EpicGames._handle_eula_modal(page):
+                logger.info("✅ 已自动处理 EULA 协议弹窗，继续等待结账页面")
                 continue
 
             # Do not issue DOM commands while Epic is creating the purchase
@@ -1074,6 +1089,98 @@ class EpicGames:
             return True
         except Exception as err:
             logger.warning(f"⚠️ 处理 Epic 设备不支持弹窗失败: {err}")
+            return False
+
+    @staticmethod
+    async def _handle_eula_modal(page: Any) -> bool:
+        """Accept Epic's End User License Agreement (EULA) modal if present."""
+        if not hasattr(page, "locator"):
+            return False
+
+        try:
+            dialog = None
+            try:
+                candidate = page.locator("[role='dialog']").filter(
+                    has_text=re.compile(r"(license agreement|eula|许可协议)", re.I)
+                ).first
+                if await candidate.is_visible(timeout=300):
+                    dialog = candidate
+            except Exception:
+                dialog = None
+
+            if dialog is None:
+                body_text = ""
+                with suppress(Exception):
+                    body_text = (await page.locator("body").text_content(timeout=500) or "").lower()
+                if "end user license agreement" not in body_text and "license agreement" not in body_text:
+                    return False
+
+            logger.info("ℹ️ 检测到 Epic EULA 许可协议弹窗，准备自动勾选并接受")
+
+            clicked_cb = await _await_with_cleanup(
+                page.evaluate(
+                    """() => {
+                        const checkboxes = Array.from(document.querySelectorAll('[role="checkbox"], input[type="checkbox"]'));
+                        for (const cb of checkboxes) {
+                            const isChecked = cb.getAttribute('aria-checked') === 'true' || 
+                                              cb.getAttribute('data-state') === 'checked' || 
+                                              cb.checked;
+                            if (!isChecked) {
+                                cb.scrollIntoView({block: 'center', inline: 'center'});
+                                cb.click();
+                                return true;
+                            }
+                        }
+                        const labels = Array.from(document.querySelectorAll('label, #agree'));
+                        for (const lb of labels) {
+                            const text = (lb.textContent || '').toLowerCase();
+                            if (text.includes('agree') || text.includes('license')) {
+                                lb.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }"""
+                ),
+                timeout=5,
+            )
+            if clicked_cb:
+                logger.info("✅ 已勾选 EULA 同意复选框")
+            await asyncio.sleep(0.8)
+
+            accepted = False
+            for _ in range(3):
+                accepted = await _await_with_cleanup(
+                    page.evaluate(
+                        """() => {
+                            const buttons = Array.from(document.querySelectorAll('button'));
+                            for (const btn of buttons) {
+                                const text = (btn.textContent || '').trim().toLowerCase();
+                                if ((text === 'accept' || text === '接受' || text === 'agree') && !btn.disabled) {
+                                    btn.scrollIntoView({block: 'center', inline: 'center'});
+                                    btn.click();
+                                    return true;
+                                }
+                            }
+                            return false;
+                        }"""
+                    ),
+                    timeout=5,
+                )
+                if accepted:
+                    break
+                await asyncio.sleep(0.8)
+
+            if accepted:
+                logger.info("✅ 已点击 Accept 接受 EULA 协议")
+                await page.wait_for_timeout(2000)
+                return True
+            else:
+                logger.warning("⚠️ 发现 EULA 弹窗但未能在时限内点击 Accept 按钮")
+                return False
+
+        except Exception as err:
+            logger.warning(f"⚠️ 处理 Epic EULA 弹窗异常: {err}")
             return False
 
     @staticmethod
@@ -1297,15 +1404,49 @@ class EpicGames:
         while time.monotonic() < deadline:
             for frame in page.frames:
                 url = frame.url or ""
+                # 必须是 challenge 类型的专用 frame
                 if "hcaptcha.com" not in url or "frame=challenge" not in url:
                     continue
                 with suppress(Exception):
-                    challenge = frame.locator("div.challenge-view").first
-                    if await _await_with_cleanup(
-                        challenge.is_visible(timeout=1500), timeout=2
-                    ):
-                        return True
+                    modal = frame.locator(
+                        "div.challenge-view, div.interface-challenge, div.challenge-container, div.challenge-modal, div.button-submit, [aria-label*='Verify']"
+                    ).first
+                    if await _await_with_cleanup(modal.is_visible(timeout=1500), timeout=2):
+                        box = await modal.bounding_box()
+                        if box and box["width"] > 100 and box["height"] > 100:
+                            logger.info(f"✅ 检测到可见 hCaptcha 挑战组件(box={box}): {url[:80]}")
+                            return True
             await asyncio.sleep(0.5)
+        return False
+
+    @staticmethod
+    async def _is_cloudflare_challenge(page: Page) -> bool:
+        """快速判断页面或任意结账 frame 是否被 Cloudflare / Talon 5秒盾或安全拦截。"""
+        try:
+            title = (await page.title()) or ""
+            if any(t in title for t in ["Just a moment...", "One more step"]):
+                return True
+            cf_el = page.locator(
+                "[data-t='challengeTitle'], .cf_challenge, div#lVJB5, input[name='cf-turnstile-response'], .cf-turnstile, [data-t='challengeSubtitle']"
+            ).first
+            if await _await_with_cleanup(cf_el.is_visible(timeout=300), timeout=1):
+                return True
+
+            for fr in page.frames:
+                with suppress(Exception):
+                    fr_title = (await fr.title()) or ""
+                    if any(t in fr_title for t in ["Just a moment...", "One more step"]):
+                        return True
+                    talon_el = fr.locator(
+                        "h1:has-text('One more step'), "
+                        "h4:has-text('security check'), "
+                        "[id*='talon_error_message'], "
+                        "[id*='h_captcha_challenge']"
+                    ).first
+                    if await _await_with_cleanup(talon_el.is_visible(timeout=200), timeout=1):
+                        return True
+        except Exception:
+            pass
         return False
 
     async def _confirm_checkout_success(
@@ -1318,6 +1459,10 @@ class EpicGames:
     ) -> bool:
         if page.url.startswith(URL_CART_SUCCESS):
             logger.success("🎉 领取成功：已进入结账成功页面")
+            return True
+
+        if await self._current_product_is_owned(page):
+            logger.success("🎉 领取成功：商详页按钮已确认入库 (IN LIBRARY)")
             return True
 
         if check_order_history and await self._order_history_contains(namespace):
@@ -1346,6 +1491,10 @@ class EpicGames:
         attempt = 0
         while time.monotonic() < deadline:
             attempt += 1
+            if await self._is_cloudflare_challenge(page):
+                logger.warning("⚠️ 检测到结账被 Cloudflare / Talon 安全风控拦截，立即中断并触发节点轮换")
+                raise CloudflareBlockedException("Checkout blocked by Epic security challenge (Talon / Cloudflare)")
+
             if await self._confirm_checkout_success(
                 page,
                 product_url,
@@ -1357,6 +1506,10 @@ class EpicGames:
             remaining = max(0, int(deadline - time.monotonic()))
             logger.info(f"🔁 等待入库确认: 第 {attempt} 次复核，剩余约 {remaining}s")
             await asyncio.sleep(interval_ms / 1000)
+
+        if await self._is_cloudflare_challenge(page):
+            logger.warning("⚠️ 检测到结账被 Cloudflare / Talon 安全风控拦截，立即中断并触发节点轮换")
+            raise CloudflareBlockedException("Checkout blocked by Epic security challenge (Talon / Cloudflare)")
 
         return await self._confirm_checkout_success(
             page,
@@ -1377,6 +1530,7 @@ class EpicGames:
         challenge_error: Exception | None = None
 
         try:
+            await self._handle_eula_modal(page)
             await self._handle_device_not_supported_modal(page)
             checkout_state = await self._wait_for_checkout_surface(page)
             if checkout_state == "device_not_supported":
@@ -1391,12 +1545,58 @@ class EpicGames:
                 return True
 
             wpc, payment_btn = await self._active_purchase_container(page, wait_for_surface=False)
-            if await self._handle_device_not_supported_modal(page):
+            if await self._handle_device_not_supported_modal(page) or await self._handle_eula_modal(page):
                 wpc, payment_btn = await self._active_purchase_container(page)
 
-            logger.debug(f"点击支付按钮: {await payment_btn.text_content()}")
-            await self._click_checkout_cta(wpc, payment_btn)
+            with suppress(Exception):
+                shot_path = RUNTIME_DIR.joinpath("checkout_debug_instant.png")
+                await page.screenshot(path=str(shot_path))
+                RUNTIME_DIR.joinpath("checkout_debug_instant.html").write_text(
+                    await page.content(), encoding="utf-8"
+                )
+                for idx, fr in enumerate(page.frames):
+                    if "/purchase" in (fr.url or "").lower() or fr != page.main_frame:
+                        with suppress(Exception):
+                            fr_html = await fr.content()
+                            RUNTIME_DIR.joinpath(f"checkout_debug_frame_{idx}.html").write_text(
+                                fr_html, encoding="utf-8"
+                            )
+                logger.info(f"🧾 [即时结账调试] 快照与 frame 结构已保存至 {RUNTIME_DIR}")
+
+            with suppress(Exception):
+                if hasattr(wpc, "locator"):
+                    cb_count = await wpc.locator("input[type='checkbox'], [role='checkbox']").count()
+                    if cb_count > 0:
+                        logger.info(f"🔎 结账容器内发现 {cb_count} 个复选框:")
+                        for i in range(cb_count):
+                            cb = wpc.locator("input[type='checkbox'], [role='checkbox']").nth(i)
+                            checked = await cb.is_checked()
+                            visible = await cb.is_visible()
+                            label_text = ""
+                            with suppress(Exception):
+                                parent = cb.locator("xpath=..")
+                                label_text = (await parent.text_content(timeout=500) or "").strip()
+                            logger.info(f"    复选框[{i}]: visible={visible} checked={checked} text={label_text!r}")
+
+            async with EpicGames._network_probe(page, "checkout_cta"):
+                logger.debug(f"点击支付按钮: {await payment_btn.text_content()}")
+                await self._click_checkout_cta(wpc, payment_btn)
+
             await asyncio.sleep(2)
+            with suppress(Exception):
+                safe_title = re.sub(r"[^a-zA-Z0-9_.-]+", "_", product_url.split("/")[-1])
+                await page.screenshot(path=str(RUNTIME_DIR.joinpath(f"checkout_debug_post_{safe_title}.png")))
+                RUNTIME_DIR.joinpath(f"checkout_debug_post_{safe_title}.html").write_text(
+                    await page.content(), encoding="utf-8"
+                )
+                for idx, fr in enumerate(page.frames):
+                    with suppress(Exception):
+                        fr_html = await fr.content()
+                        RUNTIME_DIR.joinpath(f"checkout_debug_post_{safe_title}_frame_{idx}.html").write_text(
+                            fr_html, encoding="utf-8"
+                        )
+                logger.info(f"🧾 [即时结账调试] 点击后现场已落盘: {safe_title}")
+
             # _click_checkout_cta 用 no_wait_after=True，"常规点击完成"只表示事件已派发，
             # 不代表 Epic 受理了订单。实测成功与失败运行在点击段的日志逐字相同，
             # 无法区分"点击生效"与"点击被吞"。这里记录点击后 2s 的按钮与页面状态；
@@ -1466,6 +1666,8 @@ class EpicGames:
                 raise RuntimeError(f"captcha checkout verification failed: {challenge_error}")
 
             if challenge_error is None:
+                if await self._is_cloudflare_challenge(page):
+                    raise CloudflareBlockedException("Checkout blocked by Epic security challenge (Talon / Cloudflare)")
                 with suppress(Exception):
                     await self._click_checkout_cta(wpc, payment_btn)
                     await asyncio.sleep(2)
@@ -1481,7 +1683,7 @@ class EpicGames:
                 return True
 
         except Exception as err:
-            if isinstance(err, PageNavigationTimeout):
+            if isinstance(err, (PageNavigationTimeout, CloudflareBlockedException)):
                 raise
             if _is_captcha_error(err):
                 raise RuntimeError(f"captcha checkout verification failed: {err}") from err
@@ -1555,14 +1757,22 @@ class EpicGames:
                 "//button[contains(@class, 'purchase') and not(@disabled)]",
             ]
 
-            # 2. 检查按钮可见性与状态（渐进式轮询最多 15 秒）
+            # 2. 检查按钮可见性与状态（渐进式轮询最多 30 秒，含 Cloudflare 盾检测）
             active_btn = None
             is_owned = False
             start_wait = time.time()
-            max_wait_seconds = 15.0
+            max_wait_seconds = 30.0
 
             try:
                 while time.time() - start_wait < max_wait_seconds:
+                    # 优先检测是否遭遇 Cloudflare 5秒盾拦截
+                    if await EpicGames._is_cloudflare_challenge(page):
+                        with suppress(Exception):
+                            await page.screenshot(path="/app/app/volumes/runtime/cf_blocked.png")
+                            Path("/app/app/volumes/runtime/cf_blocked.html").write_text(await page.content(), encoding="utf-8")
+                        logger.error(f"🛡️ 检测到该出口节点被 Cloudflare 拦截 (5秒盾)，出口 IP 可能已被风控: {promotion.title}")
+                        raise CloudflareBlockedException(f"Cloudflare 5秒盾拦截: {promotion.title}")
+
                     if await purchase_btn.is_visible(timeout=500):
                         active_btn = purchase_btn
                         break
@@ -1610,6 +1820,8 @@ class EpicGames:
                     continue
 
                 if active_btn is None:
+                    if await EpicGames._is_cloudflare_challenge(page):
+                        raise CloudflareBlockedException(f"Cloudflare 5秒盾拦截 (超时后复核): {promotion.title}")
                     with suppress(Exception):
                         await page.screenshot(path="/app/app/volumes/runtime/not_found_btn.png")
                         dump_html = await page.content()
@@ -1620,6 +1832,8 @@ class EpicGames:
                     continue
 
                 purchase_btn = active_btn
+            except CloudflareBlockedException:
+                raise
             except Exception as err:
                 logger.warning(f"⚠️ 检查购买按钮失败: {err}")
                 outcomes[promotion.title] = "failed"
